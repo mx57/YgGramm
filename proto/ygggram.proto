@@ -1,0 +1,344 @@
+// File: proto/ygggram.proto
+syntax = "proto3";
+
+package ygggram;
+
+option go_package = "ygggram/core/proto;yggproto";
+option java_package = "org.ygggram.proto";
+option java_outer_classname = "YgggramProto";
+
+// ==========================================
+// CONFIGURATION & INITIALIZATION
+// ==========================================
+
+enum AntiDpiMode {
+  ANTI_DPI_DISABLED = 0;
+  ANTI_DPI_UTLS_CHROME = 1;
+  ANTI_DPI_UTLS_IOS = 2;
+  ANTI_DPI_SHADOW_TLS_V3 = 3;
+  ANTI_DPI_WEBSOCKET_CDN = 4;
+  ANTI_DPI_UDP_QUIC_OBFS = 5;
+}
+
+enum PeerTransportType {
+  TRANSPORT_TCP = 0;
+  TRANSPORT_TLS_UTLS = 1;
+  TRANSPORT_WSS = 2;
+  TRANSPORT_SHADOWTLS = 3;
+  TRANSPORT_QUIC_OBFS = 4;
+}
+
+message NodeConfig {
+  string data_dir = 1;
+  string cache_dir = 2;
+  string mnemonic_seed = 3;
+  bytes ed25519_node_privkey = 4;
+  bytes x25519_chat_privkey = 5;
+  bytes master_key_256 = 6;
+  AntiDpiMode anti_dpi_mode = 7;
+  string anti_dpi_sni = 8;
+  string anti_dpi_password = 9;
+  repeated string bootstrap_peers = 10;
+  repeated string doh_servers = 11;
+  bool enable_dht_bep44 = 12;
+  string listen_address = 13;
+  int32 listen_port = 14;
+  bool userspace_only = 15;
+  uint32 connection_timeout_seconds = 16;
+  uint32 keepalive_interval_seconds = 17;
+}
+
+// ==========================================
+// CRYPTOGRAPHIC & NETWORK ENVELOPES
+// ==========================================
+
+message SealedEnvelope {
+  bytes recipient_x25519_pubkey = 1;
+  bytes ephemeral_x25519_pubkey = 2;
+  bytes encrypted_payload = 3;
+  bytes nonce = 4;
+  uint64 timestamp = 5;
+  uint64 pow_nonce = 6;
+  bytes blind_token = 7;
+  uint32 routing_hops = 8;
+}
+
+message PreKeyBundle {
+  bytes identity_ed25519_pubkey = 1;
+  bytes identity_x25519_pubkey = 2;
+  bytes signed_prekey = 3;
+  bytes signed_prekey_signature = 4;
+  repeated bytes one_time_prekeys = 5;
+  uint64 prekey_timestamp = 6;
+  uint32 key_id = 7;
+}
+
+message TextContent {
+  string body = 1;
+  repeated string mentions = 2;
+}
+
+message ReplyContent {
+  string reply_to_message_id = 1;
+  string body = 2;
+  string quote_snippet = 3;
+}
+
+message ReactionContent {
+  string target_message_id = 1;
+  string emoji = 2;
+  bool is_removed = 3;
+}
+
+message MediaManifest {
+  string file_name = 1;
+  string mime_type = 2;
+  uint64 file_size = 3;
+  bytes sha256_hash = 4;
+  bytes xchacha_key = 5;
+  bytes xchacha_nonce = 6;
+  repeated bytes chunk_hashes = 7;
+  bytes thumbnail_bytes = 8;
+  uint32 width = 9;
+  uint32 height = 10;
+  uint32 duration_seconds = 11;
+}
+
+enum CallSignalType {
+  CALL_SIGNAL_OFFER = 0;
+  CALL_SIGNAL_ANSWER = 1;
+  CALL_SIGNAL_ICE_CANDIDATE = 2;
+  CALL_SIGNAL_HANGUP = 3;
+  CALL_SIGNAL_REJECT = 4;
+}
+
+message CallSignalContent {
+  string call_id = 1;
+  CallSignalType signal_type = 2;
+  string sdp_payload = 3;
+  string ice_candidate = 4;
+  bool is_video = 5;
+}
+
+message ChatMessage {
+  string message_id = 1;
+  string conversation_id = 2;
+  string sender_node_ipv6 = 3;
+  bytes sender_x25519_pubkey = 4;
+  uint64 timestamp_ms = 5;
+  bool is_outbound = 6;
+
+  oneof content {
+    TextContent text = 7;
+    ReplyContent reply = 8;
+    ReactionContent reaction = 9;
+    MediaManifest media = 10;
+    CallSignalContent call_signal = 11;
+  }
+}
+
+message ContactCard {
+  string node_ipv6 = 1;
+  bytes ed25519_pubkey = 2;
+  bytes x25519_pubkey = 3;
+  string nickname = 4;
+  string bio = 5;
+  bytes avatar_hash = 6;
+  uint64 updated_at = 7;
+  bool is_verified = 8;
+}
+
+message BackupChunk {
+  string chunk_id = 1;
+  uint64 offset = 2;
+  uint32 size = 3;
+  bytes sha256_hash = 4;
+  string storage_provider = 5;
+}
+
+message BackupManifest {
+  uint64 backup_id = 1;
+  uint64 created_at = 2;
+  uint64 total_bytes = 3;
+  uint32 chunk_count = 4;
+  bytes root_merkle_hash = 5;
+  bytes argon2id_salt = 6;
+  string compression_algo = 7;
+  string encryption_algo = 8;
+  repeated BackupChunk chunks = 9;
+}
+
+// ==========================================
+// RPC REQUESTS & RESPONSES (CORE INTERFACE)
+// ==========================================
+
+message StartNodeReq {
+  NodeConfig config = 1;
+}
+
+message StopNodeReq {
+  bool force = 1;
+}
+
+message SendMessageReq {
+  string destination_ipv6 = 1;
+  bytes destination_x25519_pubkey = 2;
+  ChatMessage message = 3;
+}
+
+message ConnectPeerReq {
+  string peer_uri = 1;
+  PeerTransportType transport = 2;
+  string custom_sni = 3;
+}
+
+message DisconnectPeerReq {
+  string peer_uri = 1;
+}
+
+message GetPeersReq {}
+
+message GetNodeStatusReq {}
+
+message CreateBackupReq {
+  string destination_target = 1;
+  string encryption_passphrase = 2;
+}
+
+message RestoreBackupReq {
+  string source_target = 1;
+  string encryption_passphrase = 2;
+}
+
+message AddContactReq {
+  ContactCard contact = 1;
+}
+
+message CoreRequest {
+  uint64 request_id = 1;
+  oneof request {
+    StartNodeReq start_node = 2;
+    StopNodeReq stop_node = 3;
+    SendMessageReq send_message = 4;
+    ConnectPeerReq connect_peer = 5;
+    DisconnectPeerReq disconnect_peer = 6;
+    GetPeersReq get_peers = 7;
+    GetNodeStatusReq get_node_status = 8;
+    CreateBackupReq create_backup = 9;
+    RestoreBackupReq restore_backup = 10;
+    AddContactReq add_contact = 11;
+  }
+}
+
+message PeerInfo {
+  string uri = 1;
+  string remote_address = 2;
+  string yggdrasil_ipv6 = 3;
+  PeerTransportType transport = 4;
+  bool is_inbound = 5;
+  uint64 bytes_sent = 6;
+  uint64 bytes_received = 7;
+  uint64 latency_ms = 8;
+  bool is_connected = 9;
+  string sni_used = 10;
+}
+
+message NodeStatusResp {
+  bool is_running = 1;
+  string my_ipv6 = 2;
+  bytes my_ed25519_pubkey = 3;
+  bytes my_x25519_pubkey = 4;
+  uint32 connected_peers_count = 5;
+  uint64 uptime_seconds = 6;
+  AntiDpiMode active_anti_dpi = 7;
+  uint64 routing_table_nodes = 8;
+}
+
+message PeerListResp {
+  repeated PeerInfo peers = 1;
+}
+
+message SendMessageResp {
+  string message_id = 1;
+  bool delivered_directly = 2;
+  bool queued_for_store_and_forward = 3;
+}
+
+message BackupResp {
+  BackupManifest manifest = 1;
+  string status_message = 2;
+}
+
+message CoreResponse {
+  uint64 request_id = 1;
+  bool success = 2;
+  string error_message = 3;
+  oneof response {
+    NodeStatusResp node_status = 4;
+    PeerListResp peer_list = 5;
+    SendMessageResp send_message = 6;
+    BackupResp backup = 7;
+  }
+}
+
+// ==========================================
+// ASYNCHRONOUS EVENTS (CALLBACK STREAM)
+// ==========================================
+
+message NetworkStatusEvent {
+  bool online = 1;
+  string current_ipv6 = 2;
+  uint32 active_peers = 3;
+  uint64 total_rx_bytes = 4;
+  uint64 total_tx_bytes = 5;
+  string status_note = 6;
+}
+
+message PeerListUpdatedEvent {
+  repeated PeerInfo peers = 1;
+}
+
+message AntiDpiStatusEvent {
+  AntiDpiMode mode = 1;
+  string current_sni = 2;
+  bool handshake_success = 3;
+  string transport_details = 4;
+  bool fallback_triggered = 5;
+}
+
+message IncomingMessageEvent {
+  ChatMessage message = 1;
+  bool sealed_sender_verified = 2;
+  uint64 hop_count = 3;
+}
+
+message BackupProgressEvent {
+  uint64 backup_id = 1;
+  uint32 completed_chunks = 2;
+  uint32 total_chunks = 3;
+  float progress_percentage = 4;
+  string current_action = 5;
+  bool is_finished = 6;
+  string error = 7;
+}
+
+message IncomingCallEvent {
+  string call_id = 1;
+  string caller_ipv6 = 2;
+  ContactCard caller_contact = 3;
+  bool has_video = 4;
+  CallSignalContent signal = 5;
+}
+
+message CoreEvent {
+  uint64 event_id = 1;
+  uint64 timestamp_ms = 2;
+  oneof event {
+    NetworkStatusEvent network_status = 3;
+    PeerListUpdatedEvent peers_updated = 4;
+    AntiDpiStatusEvent anti_dpi_status = 5;
+    IncomingMessageEvent incoming_message = 6;
+    BackupProgressEvent backup_progress = 7;
+    IncomingCallEvent incoming_call = 8;
+  }
+}

@@ -1,0 +1,26 @@
+// File: app/pubspec.yaml
+name: ygggram
+description: "YggGram - Decentralized messenger with Anti-DPI over Yggdrasil overlay"
+publish_to: "none"
+version: 1.0.0+1
+
+environment:
+  sdk: ">=3.4.0 <4.0.0"
+  flutter: ">=3.24.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  ffi: ^2.1.3
+  protobuf: ^3.1.0
+  path_provider: ^2.1.4
+  path: ^1.9.0
+  flutter_riverpod: ^2.5.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
