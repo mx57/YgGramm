@@ -142,7 +142,7 @@ class AntiDpiRadarScreen extends ConsumerWidget {
 
             // Active Peers Section
             Row(
-              mainAxisAlignment: MainAxisAlignment.between,
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
                 const Text('Активные пиры и шлюзы маскировки', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 14)),
                 TextButton.icon(

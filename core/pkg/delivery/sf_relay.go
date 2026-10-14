@@ -2,7 +2,6 @@
 package delivery
 
 import (
-	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -315,7 +314,7 @@ func (d *MessageDispatcher) DispatchMessage(
 	copy(relays, d.knownRelays)
 	d.mu.RUnlock()
 
-	mailboxID := sealedEnvelope.MailboxID
+	_ = sealedEnvelope.MailboxID
 	var successfulRelays []string
 
 	for _, relay := range relays {

@@ -13,6 +13,7 @@ class WindowsIntegrationService {
   bool _isRelayBridgeEnabled = false;
   int _unreadCount = 0;
 
+  bool get isTrayInitialized => _isTrayInitialized;
   bool get isAutoStartEnabled => _isAutoStartEnabled;
   bool get isRelayBridgeEnabled => _isRelayBridgeEnabled;
   int get unreadCount => _unreadCount;

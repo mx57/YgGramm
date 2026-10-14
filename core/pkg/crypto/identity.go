@@ -6,7 +6,6 @@ import (
 	"crypto/ed25519"
 	"crypto/hmac"
 	"crypto/rand"
-	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/binary"
 	"errors"

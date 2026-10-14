@@ -148,7 +148,7 @@ class BackupSettingsScreen extends ConsumerWidget {
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Row(
-                    mainAxisAlignment: MainAxisAlignment.between,
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
                       const Text('Лимит кэша медиа и чанков:', style: TextStyle(color: Colors.white, fontSize: 13)),
                       Text('${state.mediaCacheLimitMB} MB', style: const TextStyle(color: Color(0xFF10B981), fontWeight: FontWeight.bold, fontSize: 13)),
