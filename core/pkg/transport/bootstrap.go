@@ -321,7 +321,7 @@ func (pm *PeerManager) SelectBestPeer(ctx context.Context) (*BootstrapPeer, erro
 
 	for _, peer := range candidates {
 		probeCtx, cancel := context.WithTimeout(ctx, 4*time.Second)
-		rtt, err := pm.ProbePeer(probeCtx, peer)
+		_, err := pm.ProbePeer(probeCtx, peer)
 		cancel()
 
 		if err == nil {

@@ -116,7 +116,7 @@ class _AdaptiveShellState extends ConsumerState<AdaptiveShell> {
                 _navIcon(2, Icons.cloud_sync_outlined, Icons.cloud_sync, 'Бэкап'),
                 const Spacer(),
                 IconButton(
-                  icon: const Icon(Icons.vpn_key_outlined, color: Colors.slate400),
+                  icon: const Icon(Icons.vpn_key_outlined, color: Color(0xFF94A3B8)),
                   tooltip: 'Крипто-профиль / Мнемоника',
                   onPressed: () {
                     Navigator.push(

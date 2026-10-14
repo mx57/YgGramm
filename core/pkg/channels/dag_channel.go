@@ -2,15 +2,13 @@
 package channels
 
 import (
+	"bytes"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
-	"fmt"
 	"sort"
-	"strings"
 	"sync"
 	"time"
 )

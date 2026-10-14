@@ -27,7 +27,6 @@ class YggGramApp extends StatelessWidget {
           primary: Color(0xFF10B981),
           secondary: Color(0xFF06B6D4),
           surface: Color(0xFF0B1120),
-          background: Color(0xFF0F172A),
         ),
         fontFamily: 'Roboto',
       ),
