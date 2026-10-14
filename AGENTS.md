@@ -1,84 +1,36 @@
-# AGENTS.md — Инструкция для AI-Агентов и Разработчиков Core
+# AGENTS.md — YggGram Architecture & Engineering Rules for Jules
 
-Этот документ содержит обязательные архитектурные соглашения, правила проектирования и стандарты кодовой базы проекта **YggGram**. Любой AI-агент или инженер, модифицирующий или расширяющий репозиторий, **ОБЯЗАН** строго следовать этим правилам.
+## 1. Mission
+Ты разрабатываешь **YggGram** — флагманский кроссплатформенный децентрализованный мессенджер для **Windows (x64)** и **Android (ARM64)** на базе оверлейной сети **Yggdrasil (`200::/7`)**.
+Два главных приоритета проекта:
+1. **Абсолютная живучесть связи в условиях жесткой цензуры (ТСПУ / DPI / «белые списки» в РФ).**
+2. **Безупречный UX и дизайн уровня Telegram Desktop / Linear (Zero-Config старт, никаких сложных настроек для пользователя, мгновенный отклик).**
 
----
+## 2. Monorepo Structure
+- `proto/ygggram.proto` — единый Protobuf v3 контракт между Go-ядром и Flutter UI, а также схема сетевых P2P-пакетов.
+- `core/` — бэкенд-ядро на **Pure Go 1.23+**:
+  - `core/cmd/libygggram/` — C-ABI библиотека (`-buildmode=c-shared`), собираемая в `ygggram.dll` (Windows) и `libygggram.so` (Android).
+  - `core/pkg/yggnode/` — встраиваемый узел `yggdrasil-go` строго в Userspace (поверх `ipv6rwc` + `quic-go`), БЕЗ системных TUN/Wintun драйверов и БЕЗ прав администратора/root.
+  - `core/pkg/censorship/` — многослойный движок обхода ТСПУ/DPI:
+    * Userspace TCP Desync & TLS Record Fragmentation (разрезание ClientHello/SNI).
+    * `uTLS` (мимикрия отпечатка под Chrome 130 / YaBrowser).
+    * `ShadowTLS v3 / Reality` (маскировка рукопожатия под домены из «белого списка» РФ: `st.ozone.ru`, `yastatic.net`, `vk.com`).
+    * `XHTTP / WSS-CDN` (туннелирование поверх WebSocket/HTTP2 через CDN).
+    * `TrafficMorpher` (статистический паддинг пакетов и джиттер для защиты голосовых звонков и чатов от блокировки по ML-профилю трафика).
+    * `BootstrapEngine` (поиск пиров через DoH Яндекс/Quad9, BitTorrent Mainline DHT BEP-44, внутрироссийские узлы-мосты и «Дружеский мост» внутри инвайт-ссылок).
+  - `core/pkg/crypto/` — BIP-39 -> SLIP-0010, протокол Signal (X3DH + Double Ratchet), групповой TreeKEM/MLS, конверты `SealedSender`.
+  - `core/pkg/delivery/` — слепые Store-and-Forward (S&F) релеи с Hashcash PoW и мульти-пуш пробуждение (UnifiedPush/ntfy, проксированный FCM, адаптивный QUIC Keep-Alive).
+  - `core/pkg/contacts/` — Kademlia DHT, поиск контактов через слепое пересечение OPRF (PSI), короткие имена `@username` (Alfis/DHT) и генератор `MagicInviteLink` (ссылка/QR-код, содержащий встроенные рабочие мосты отправителя).
+  - `core/pkg/storage/` — локальная зашифрованная БД на чистом Go (`go.etcd.io/bbolt` + `XChaCha20-Poly1305` + FTS полнотекстовый индекс) и синхронизация устройств через HLC CRDT.
+  - `core/pkg/backup/` — инкрементальный Zero-Knowledge бэкап (FastCDC + Zstd + `Argon2id` + `XChaCha20-Poly1305`) с поддержкой **Яндекс.Диска**, **Google Drive (`appDataFolder` напрямую или через Yggdrasil-прокси)**, **WebDAV** и **LAN P2P Sync**.
+  - `core/pkg/media/`, `core/pkg/channels/`, `core/pkg/calls/` — роевая загрузка файлов по QUIC, каналы на базе Signed Merkle-DAG и P2P-звонки через QUIC Datagrams с защитой от ТСПУ.
+- `app/` — клиентское приложение на **Flutter 3.24+ (Windows + Android)**, строго следующее правилам из `DESIGN_SYSTEM.md`.
 
-## 1. Архитектурный манифест
-
-1. **Strict Userspace Network Stack:**
-   - **ЗАПРЕЩЕНО** подключать или требовать системные сетевые драйверы TUN/TAP, `Wintun.dll` или системные сервисы VPN (`android.net.VpnService`).
-   - Все сетевые операции оверлея `0200::/7` выполняются в пространстве пользователя через `OverlayPacketConn` и виртуальные потоки.
-   - Мессенджер должен работать у обычного непривилегированного пользователя без прав Администратора на Windows и без Root на Android.
-
-2. **C-ABI и Управление Памятью (Go $\leftrightarrow$ Dart FFI):**
-   - Точка входа C-ABI расположена в `core/cmd/libygggram/main.go`.
-   - Любые данные, передаваемые из Go в Dart/C-хост через указатели, **ОБЯЗАНЫ** аллоцироваться в Си-куче через `C.CBytes(buf)`.
-   - После чтения данных Dart-сторона обязана вызвать экспортированную функцию `FreeMemory(ptr)`, которая вызывает `C.free()`.
-   - Для асинхронных событий из Go-горутин используется потокобезопасный `NativeCallable<CNativeEventCallback>.listener` из `dart:ffi`.
-
-3. **Контракты Данных (Single Source of Truth):**
-   - Любые изменения форматов сообщений, конфигураций узла или конвертов обязаны начинаться с редактирования `proto/ygggram.proto`.
-   - Бинарная сериализация Protobuf v3 обязательна для сетевых конвертов `SealedEnvelope`, `ChatMessage` и RPC-команд `CoreRequest` / `CoreEvent`.
-
----
-
-## 2. Стандарты Кода и Анти-Slop Правила
-
-- **ЗАПРЕЩЕНО** оставлять заглушки вида `// TODO`, `// implement here`, `...` или пропускать обработку ошибок через `_ = ...` в критических криптографических и сетевых путях.
-- Каждый файл должен быть законченным, готовым к компиляции модулем от ключевого слова `package` до последней закрывающей скобки.
-- В начале каждого ответа при диалоге с пользователем выводи актуальное дерево файлов проекта (`Project File Tree`), помечая маркеры `[NEW]` или `[UPDATED]`.
-- Сохраняй точные комментарии пути к файлу в первой строке: `// File: core/pkg/...`.
-
----
-
-## 3. Специфика Операционных Систем
-
-### Windows (x64 / ARM64):
-- **Пути данных:** Используй `%APPDATA%\YggGram\data` для базы данных и `%APPDATA%\YggGram\cache` для медиа.
-- **Реестр автозапуска:** Только пользовательская ветка `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`. Запрещено писать в `HKLM` (требует прав админа).
-- **Сборка DLL:** Компилируется с флагами `CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=x86_64-w64-mingw32-gcc go build -buildmode=c-shared`.
-
-### Android (arm64-v8a / x86_64):
-- **Пути данных:** При инициализации ядра передавай путь `context.filesDir.absolutePath`.
-- **Фоновые службы:** Для Android 14+ (API 34) Foreground Service обязан декларировать тип `specialUse` или `connectedDevice` в манифесте.
-- **WakeLock:** Ограничивай захват `WakeLock` минимальным интервалом (до 5 секунд) для выемки S&F сообщений.
-- **Сборка SO:** Компилируется через NDK Clang с указанием SONAME `libygggram.so` и копируется в `app/android/app/src/main/jniLibs/{abi}/`.
-
----
-
-## 4. Криптографические Требования
-
-1. **Ключи Идентичности:**
-   - Деривация из BIP-39 мнемоники через `PBKDF2-HMAC-SHA512` (2048 раундов) и `HKDF-SHA512`.
-   - `m/44'/9999'/0'`: `Ed25519` для адреса узла Yggdrasil.
-   - `m/44'/9999'/1'`: `X25519` (`crypto/ecdh`) для личных чатов.
-   - `m/44'/9999'/3'`: `BackupMasterKey` (32 байта) для облачных бэкапов.
-2. **Диалоги 1-на-1:**
-   - X3DH (Extended Triple Diffie-Hellman) по PreKeyBundle собеседника.
-   - Double Ratchet: KDF ratchet (цепочки отправки/приема) + DH ratchet на X25519.
-   - Обязательное кэширование пропущенных ключей (`skippedKeys`) с TTL не менее 7 дней для защиты от потери пакетов.
-3. **Метаданные (Sealed Sender):**
-   - Все сообщения на Store-and-Forward релеи упаковываются в `SealedEnvelope` с анонимным `MailboxID = HMAC(PubKey, epoch)`. Релей никогда не знает, кто отправил сообщение.
-
----
-
-## 5. Обход Блокировок (Анти-DPI / ТСПУ)
-
-- При разработке диалеров к внешним пирам обязательно поддерживать:
-  1. **TCP Record Fragmentation:** Разделение ClientHello на 5-байтовый TLS заголовок и тело пакета с микрозадержкой.
-  2. **uTLS Chrome:** Подмена ClientHello под профиль `HelloChrome_Auto` и ALPN `h2, http/1.1`.
-  3. **WSS CDN:** Обертка фреймов в бинарные WebSocket кадры (`opcode 0x02`) через Cloudflare.
-  4. **ShadowTLS v3:** Рукопожатие с белым списком доменов РФ (`yandex.ru`, `vk.com`) и HMAC-токеном.
-  5. **DoH / DHT Bootstrap:** Параллельный опрос DNS-over-HTTPS (Яндекс.DNS, Quad9) и BEP-44 DHT при недоступности жестко зашитых пиров.
-
----
-
-## 6. Чеклист перед коммитом
-
-- [ ] `Makefile`: `make proto` отрабатывает без ошибок.
-- [ ] Все пакеты в `core/pkg/` компилируются без синтаксических ошибок.
-- [ ] `libygggram` собирается с `-buildmode=c-shared`.
-- [ ] Экспортированные функции снабжены маркером `//export`.
-- [ ] Код Flutter в `app/lib/` проходит `flutter analyze`.
-- [ ] Никакие секретные ключи или токены не вшиты в исходный код.
+## 3. Mandatory Engineering Rules for Jules
+1. **NO PLACEHOLDERS OR STUBS:** Запрещено писать `// TODO`, `// implement here`, пустые методы или фейковые заглушки. Каждый файл пишется полностью.
+2. **NO C-SQLITE DEPENDENCIES:** Для бесшовной кросс-компиляции под Windows и Android используй только Pure-Go базы данных (`go.etcd.io/bbolt`) с шифрованием `golang.org/x/crypto/chacha20poly1305`.
+3. **MANDATORY VM VERIFICATION BEFORE PR:** Перед завершением любой задачи выполни в терминале VM:
+   - `cd core && go vet ./...`
+   - `cd core && go test -v -race ./...`
+   - `cd core && GOOS=windows GOARCH=amd64 CGO_ENABLED=1 CC=x86_64-w64-mingw32-gcc go build -buildmode=c-shared -o build/ygggram.dll ./cmd/libygggram`
+   - Если изменялся каталог `app/`: обязательно выполни `cd app && flutter analyze && flutter test`.

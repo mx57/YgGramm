@@ -49,6 +49,18 @@ const FILES_LIST: FileViewerItem[] = [
     description: 'Strict engineering standards for LLM agents: pure Go C-ABI, userspace networking, and zero-slop rules',
   },
   {
+    path: 'DESIGN_SYSTEM.md',
+    badge: 'Design System',
+    type: 'script',
+    description: 'Obsidian & Emerald luxury design system (Telegram Desktop × Linear), adaptive layout, and tokens',
+  },
+  {
+    path: 'scripts/jules_setup.sh',
+    badge: 'VM Automation',
+    type: 'script',
+    description: 'Automated Jules VM setup script: Go 1.23, Flutter 3.24, MinGW-w64, NDK, and validation suite',
+  },
+  {
     path: 'app/lib/ui/adaptive_shell.dart',
     badge: 'Flutter Adaptive',
     type: 'dart',
@@ -612,6 +624,35 @@ export default function App() {
 - Network: Strict userspace only. Never require Wintun or android.net.VpnService.
 - Contracts: Changes must start with proto/ygggram.proto.
 - Quality: Zero placeholders or TODOs allowed.`}
+                  </pre>
+                )}
+
+                {selectedFilePath === 'DESIGN_SYSTEM.md' && (
+                  <pre className="text-emerald-300">
+{`# 🎨 DESIGN_SYSTEM.md — Obsidian & Emerald Design System
+- Aesthetic: Telegram Desktop × Linear — Zero-latency feel, information density.
+- Palette: Obsidian Deep (#080B10, #0E131B, #161D28) + Electric Emerald (#00E5A3) + Cyber Cyan (#00D2FF).
+- Typography: Inter (UI text) + JetBrains Mono (IPv6 200::/7, Ed25519 keys, hashes).
+- Desktop Layout (>900px): 3-column split view (Folders 64px, Chat List 320px, Active Chat, Drawer 300px).
+- Android Layout: 1-handed ergonomic navigation, Swipe-to-reply, Haptic feedback, FLAG_SECURE.
+- Anti-DPI Radar: Live peer RTT, TSPU bypass mode indicator (Direct P2P, WSS CDN, ShadowTLS).`}
+                  </pre>
+                )}
+
+                {selectedFilePath === 'scripts/jules_setup.sh' && (
+                  <pre className="text-purple-300">
+{`#!/usr/bin/env bash
+# File: scripts/jules_setup.sh — Automated Jules VM Setup Script
+- [1/6] Installs build-essential, MinGW-w64 (gcc-mingw-w64-x86-64), protobuf-compiler, cmake.
+- [2/6] Verifies / installs Go 1.23+ toolchain.
+- [3/6] Configures protoc-gen-go generator.
+- [4/6] Checks Android NDK r26+ environment.
+- [5/6] Configures Flutter 3.24+ SDK.
+- [6/6] Runs mandatory monorepo validation:
+       * protoc compilation of ygggram.proto
+       * go vet & unit tests in core/
+       * Windows x64 DLL cross-compilation: build/ygggram.dll
+       * flutter analyze in app/`}
                   </pre>
                 )}
 
