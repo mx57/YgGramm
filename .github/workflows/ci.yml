@@ -1,0 +1,60 @@
+name: YggGram CI
+
+on:
+  push:
+    branches: [ main, master, "jules-*" ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  check-go:
+    name: Check Go Core
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache-dependency-path: core/go.sum
+
+      - name: Go Vet
+        run: |
+          cd core
+          go vet ./...
+
+      - name: Go Test
+        run: |
+          cd core
+          go test -v ./...
+
+  check-flutter:
+    name: Check Flutter App
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      - name: Install dependencies
+        run: |
+          cd app
+          flutter pub get
+
+      - name: Flutter Analyze
+        run: |
+          cd app
+          flutter analyze
