@@ -31,6 +31,9 @@ enum PeerTransportType {
 message NodeConfig {
   string data_dir = 1;
   string cache_dir = 2;
+  // Фраза восстановления: 12 или 24 слова английского списка BIP-39 с
+  // контрольной суммой. Ядро отвергает фразу, у которой суммы не сходится, а не
+  // выводит из неё «на всякий случай» другой набор ключей.
   string mnemonic_seed = 3;
   bytes ed25519_node_privkey = 4;
   bytes x25519_chat_privkey = 5;
@@ -46,6 +49,21 @@ message NodeConfig {
   bool userspace_only = 15;
   uint32 connection_timeout_seconds = 16;
   uint32 keepalive_interval_seconds = 17;
+  // Wire-совместимый LAN-мультикаст Yggdrasil (ff02::114:9001). По умолчанию
+  // выключен: в тестах и CI подписка на IPv6-группу недоступна, а молча
+  // деградировать сеть ноды нельзя.
+  bool enable_lan_multicast = 18;
+  // Этот узел работает слепым S&F-релеем: хранит чужие конверты, пока их не
+  // заберёт адресат.
+  bool sf_relay_enabled = 19;
+  // Ed25519-ключи нод-релеев, куда класть конверты офлайн-адресата и у кого их
+  // забирать. Ключ ноды — адрес в оверлее, поэтому отдельного IPv6 не нужно.
+  repeated bytes sf_relay_node_keys = 20;
+  // Отдавать ли свой PreKeyBundle по запросу чужого узла (bundle_req). По
+  // умолчанию включено: без этого контакта нельзя добавить, кроме как
+  // переслать карту байтами вне сети. Выключается явно — бандл раскрывает
+  // спрашивающему набор открытых ключей этой идентичности.
+  optional bool serve_prekey_bundles = 21;
 }
 
 // ==========================================
@@ -63,6 +81,63 @@ message SealedEnvelope {
   uint32 routing_hops = 8;
 }
 
+// Кадр поверх оверлея. До Шага 6 на проводе лежал только SealedEnvelope, и
+// любой другой пакет означал бы «испорченный конверт». Служебному трафику
+// S&F-релея нужна собственная оболочка: не самописный префикс-байт, а oneof,
+// который читает тот же protobuf-парсер.
+message WireFrame {
+  oneof body {
+    SealedEnvelope chat = 1;
+    SfPut sf_put = 2;
+    SfPull sf_pull = 3;
+    SfReply sf_reply = 4;
+    BundleReq bundle_req = 5;
+    BundleResp bundle_resp = 6;
+  }
+}
+
+// Связка мастер-ключей в открытом виде. Релей обязан проверить, что X25519,
+// из которого выведен ящик, подписан тем же Ed25519, что расписал запрос.
+message WireIdentityProof {
+  bytes master_ed25519 = 1;
+  bytes master_x25519 = 2;
+  bytes binding = 3;
+  string device_id = 4;
+  string device_name = 5;
+  bytes device_ed25519 = 6;
+  bytes device_x25519 = 7;
+  int64 device_created_at = 8;
+  bytes device_cert_sig = 9;
+}
+
+// Кладу в слепой ящик: релей начинку не читает, он проверяет работу (PoW
+// лежит в самом конверте), квоту и срок хранения. Mailbox_id обязан совпасть с
+// blind_token конверта: разнобой означал бы, что письмо проиндексировано чужим
+// ящиком, то есть адресат его никогда не найдёт.
+message SfPut {
+  bytes mailbox_id = 1;
+  SealedEnvelope envelope = 2;
+}
+
+// Забираю из ящика. Подпись мастер-Ed25519 поверх домена, ящика, эпохи и метки
+// времени, а proof доказывает, что этот Ed25519 привязан к X25519, из которого
+// ящик выведен: без связки релей отдал бы почту всякому, кто посчитал
+// открытый ключ получателя.
+message SfPull {
+  bytes mailbox_id = 1;
+  int64 epoch_day = 2;
+  int64 timestamp_s = 3;
+  bytes signature = 4;
+  WireIdentityProof proof = 5;
+}
+
+message SfReply {
+  repeated SealedEnvelope envelopes = 1;
+  // Пустой список без ошибки — ящик пуст. Ошибка обязана быть названа: «нет
+  // почты» и «тебя не пустили» — это разные новости для UI и для счётчиков.
+  string error = 2;
+}
+
 message PreKeyBundle {
   bytes identity_ed25519_pubkey = 1;
   bytes identity_x25519_pubkey = 2;
@@ -71,6 +146,36 @@ message PreKeyBundle {
   repeated bytes one_time_prekeys = 5;
   uint64 prekey_timestamp = 6;
   uint32 key_id = 7;
+  // Ключ ноды Yggdrasil, по которому этому контакту реально пишутся пакеты, и
+  // подпись мастер-Ed25519, заверяющая пару «identity-X25519 ↔ этот ключ».
+  // Без второй строки карта контакта — просто два набора байтов: адрес узла
+  // может принадлежать кому угодно, и шифрование честной идентичности ушло бы в
+  // чужой узел. Проверяется при AddContact.
+  bytes node_ed25519_pubkey = 8;
+  bytes node_key_proof = 9;
+}
+
+// Запрос чужого бандла поверх оверлея. Без него контакт можно завести только
+// переслав ContactCard байтами вне сети. Request_id связывает ответ с запросом:
+// ответов может быть несколько (узел переспрашивает, дубликат тонет на
+// холодном маршруте), и брать в работу надо тот, что дошёл первым.
+message BundleReq {
+  uint64 request_id = 1;
+}
+
+// Ответ на bundle_req. Ошибка обязана быть названа словами: «бандлов не
+// раздаём» и «такого ключа у нас нет» для клиента значит разное, и молча
+// промолчать — значит отдать ожидание вместо новости.
+//
+// Ответ ничем не заверяется сверх самого бандла: доверие держится на том, что
+// (а) пакет пришёл от узла, чей ed25519-ключ стоит адресом в оверлее, (б)
+// ключ ноды в бандле совпал с запрошенным, (в) карта прошла ворота
+// verifyContact — сертификат ноды от той же идентичности, один и тот же
+// X25519 в карте и в бандле.
+message BundleResp {
+  uint64 request_id = 1;
+  PreKeyBundle bundle = 2;
+  string error = 3;
 }
 
 message TextContent {
@@ -120,6 +225,14 @@ message CallSignalContent {
   bool is_video = 5;
 }
 
+// Подтверждение доставки. Идёт тем же сквозным сеансом Double Ratchet, что и
+// обычные сообщения: S&F-релей и оверлей его не читают, а отправитель верит ему,
+// потому что шифротекст мог открыть только получатель.
+message DeliveryAckContent {
+  // message_id принятого и сохранённого сообщения.
+  string acknowledges_message_id = 1;
+}
+
 message ChatMessage {
   string message_id = 1;
   string conversation_id = 2;
@@ -127,6 +240,10 @@ message ChatMessage {
   bytes sender_x25519_pubkey = 4;
   uint64 timestamp_ms = 5;
   bool is_outbound = 6;
+  // Сквозное подтверждение получателя (получается из DeliveryAckContent).
+  // Отдельное поле, а не часть oneof: ack — это служебное содержимое, а
+  // «доставлено» — состояние уже показанного сообщения.
+  bool delivered = 12;
 
   oneof content {
     TextContent text = 7;
@@ -134,6 +251,7 @@ message ChatMessage {
     ReactionContent reaction = 9;
     MediaManifest media = 10;
     CallSignalContent call_signal = 11;
+    DeliveryAckContent delivery_ack = 13;
   }
 }
 
@@ -146,7 +264,12 @@ message ContactCard {
   bytes avatar_hash = 6;
   uint64 updated_at = 7;
   bool is_verified = 8;
+  // Бандл получателя обязателен для X3DH: без SignedPreKey/OneTimePreKey
+  // отправить сквозное сообщение невозможно.
+  PreKeyBundle bundle = 9;
 }
+
+message GetPreKeyBundleReq {}
 
 message BackupChunk {
   string chunk_id = 1;
@@ -214,6 +337,115 @@ message AddContactReq {
   ContactCard contact = 1;
 }
 
+// Генерация фразы делает ядро: entropy и словарь должны остаться на одной
+// стороне границы вместе с производными от них ключами.
+message GenerateIdentityReq {}
+
+message IdentityResp {
+  // Ровно те же байты, что потом принимает mnemonic_seed: показывать и хранить
+  // надо эту строку, а не её пересобранный где-то вариант.
+  string mnemonic = 1;
+}
+
+// Запросы чтения для UI: список строится по реальной зашифрованной базе,
+// а не по демо-константам в коде клиента.
+message ConversationInfo {
+  string conversation_id = 1;
+  string last_message = 2;
+  int64 last_timestamp_ms = 3;
+  uint32 message_count = 4;
+  uint32 unread_count = 5;
+}
+
+message ListConversationsReq {
+  uint32 limit = 1;
+}
+
+message ConversationListResp {
+  repeated ConversationInfo conversations = 1;
+}
+
+message GetMessagesReq {
+  string conversation_id = 1;
+  uint32 limit = 2;
+}
+
+message MessageListResp {
+  repeated ChatMessage messages = 1;
+}
+
+message ListContactsReq {}
+
+message ContactListResp {
+  repeated ContactCard contacts = 1;
+}
+
+// Добавить контакта по одному лишь ключу его узла: ядро шлёт bundle_req и
+// заводит карту, когда придёт честный ответ. Имя локальное — бандл его не
+// несёт, nickname выбирает тот, кто добавляет, а не тот, кого добавляют.
+message FetchContactReq {
+  // Ed25519-ключ узла Yggdrasil — он же адрес в оверлее.
+  bytes node_ed25519_pubkey = 1;
+  string nickname = 2;
+}
+
+message FetchContactResp {
+  // Запрос ушёл в сеть. Ответ — событие contact_updated, позже и с другой
+  // стороны: ждать его внутри команды нельзя, тот же mutex нужен приёмному
+  // циклу, который этот ответ и разберёт.
+  bool requested = 1;
+  uint64 request_id = 2;
+  // Адрес узла, выведенный из запрошенного ключа: UI показывает его, пока
+  // ответа нет, и сверяет с тем, что видит в списке пиров.
+  string node_ipv6 = 3;
+}
+
+// Итоговая новость по fetch-запросу: карта появилась либо ответ не сошёлся.
+// contact заполнен только при успехе; error — причина отказа (узел не
+// ответил, бандл не прошёл ворота, роль раздачи выключена).
+message ContactResolvedEvent {
+  uint64 request_id = 1;
+  ContactCard contact = 2;
+  string error = 3;
+}
+
+// Забрать почту со всех настроенных релеев прямо сейчас, не дожидаясь таймера
+// опроса: UI зовёт это при выходе из офлайна, тест — чтобы не спать секунды.
+message SfCollectReq {}
+
+message SfCollectResp {
+  // Сколько ящиков запросено у релеев. Ответы приходят асинхронно через
+  // событийный канал: команда не имеет права держать блокировку ядра, дожидаясь
+  // их, иначе приёмный цикл встанет ровно на то время, пока мы ждём.
+  uint32 requested = 1;
+  // Hex-ключи релеев, которым ушёл запрос.
+  repeated string relays = 2;
+}
+
+// Что ядро знает о своём участии в S&F. Отдельно роль хранителя и роль
+// клиента: «я держу чужие конверты» и «я забрал свои» — разные обязательства.
+message SfStats {
+  bool relay_enabled = 1;
+  uint32 relays_configured = 2;
+  // Отправитель: сколько конвертов положено на релеи и сколько не удалось.
+  uint64 pushed = 3;
+  uint64 push_failed = 4;
+  // Хранитель: сколько принято и сколько отвергнуто (PoW, квота, подпись,
+  // несвязка ящика с идентичностью).
+  uint64 stored = 5;
+  uint64 refused = 6;
+  // Клиент: сколько забрал со стороны и сколько выдал чужим конвертов.
+  uint64 pulled = 7;
+  uint64 handed_out = 8;
+  // Последняя причина отказа релея (нам как клиенту). «Ящик пуст» и «тебя не
+  // пустили» для пользователя значит разное, поэтому молча терять вторую
+  // новость нельзя: счётчик refuse её считает, а строка объясняет.
+  string last_refusal = 9;
+  // Как хранитель: сколько чужих конвертов истекло по опубликованному TTL. Это
+  // потерянная почта, и прятать её за «refused» нельзя — срок вышел честно.
+  uint64 expired = 10;
+}
+
 message CoreRequest {
   uint64 request_id = 1;
   oneof request {
@@ -227,6 +459,13 @@ message CoreRequest {
     CreateBackupReq create_backup = 9;
     RestoreBackupReq restore_backup = 10;
     AddContactReq add_contact = 11;
+    GetPreKeyBundleReq get_prekey_bundle = 12;
+    GenerateIdentityReq generate_identity = 13;
+    ListConversationsReq list_conversations = 14;
+    GetMessagesReq get_messages = 15;
+    ListContactsReq list_contacts = 16;
+    SfCollectReq sf_collect = 17;
+    FetchContactReq fetch_contact = 18;
   }
 }
 
@@ -252,6 +491,7 @@ message NodeStatusResp {
   uint64 uptime_seconds = 6;
   AntiDpiMode active_anti_dpi = 7;
   uint64 routing_table_nodes = 8;
+  SfStats sf = 9;
 }
 
 message PeerListResp {
@@ -260,8 +500,29 @@ message PeerListResp {
 
 message SendMessageResp {
   string message_id = 1;
-  bool delivered_directly = 2;
-  bool queued_for_store_and_forward = 3;
+  // Пакет ушёл в оверлей, когда spanning-дерево знало маршрут до ключа
+  // получателя. Это НЕ доставка: адресат мог быть офлайн, а «доставлено»
+  // подтверждает только DeliveryAckContent в ChatMessage.
+  bool written_to_overlay = 2;
+  // Маршрута в момент отправки не было, и конверт лёг в зашифрованную
+  // исходящую очередь ядра: сканер перешлёт ровно эти байты, как только
+  // оверлей узнает адресата, в том числе после перезапуска. Параллельно кадр
+  // может уйти слепым релеям (relays_pushed) — локальная очередь от этого не
+  // снимается, потому что релей не ручается за хранение.
+  bool queued_in_outbox = 3;
+  // Те самые байты, что ушли (или должны уйти) в сеть: кадр WireFrame с
+  // конвертом внутри. Без них клиент не сможет переложить сообщение в
+  // S&F-очередь.
+  bytes sealed_envelope = 4;
+  // Конверт оставлен слепому релею: адресат офлайн, и байты легли в чужое
+  // хранилище до его появления. Локальная очередь при этом остаётся — релеи
+  // не дают гарантии, что почту не потеряют.
+  // Честная формулировка: кадр передан оверлею в адрес релея. Хранение этим не
+  // подтверждается — релей молчит, и единственный настоящий сигнал «письмо
+  // дошло» это ACK адресата.
+  bool relays_pushed = 5;
+  // Сколько релеев получили кадр (не «сколько хранят»).
+  uint32 relays_handed = 6;
 }
 
 message BackupResp {
@@ -278,6 +539,13 @@ message CoreResponse {
     PeerListResp peer_list = 5;
     SendMessageResp send_message = 6;
     BackupResp backup = 7;
+    PreKeyBundle prekey_bundle = 8;
+    IdentityResp identity = 9;
+    ConversationListResp conversations = 10;
+    MessageListResp messages = 11;
+    ContactListResp contacts = 12;
+    SfCollectResp sf_collect = 13;
+    FetchContactResp fetch_contact = 14;
   }
 }
 
@@ -312,6 +580,19 @@ message IncomingMessageEvent {
   uint64 hop_count = 3;
 }
 
+// Судьба исходящего сообщения. Этапы отделены друг от друга, потому что
+// «оверлей принял пакет» и «адресат расшифровал» — разные утверждения:
+// первое ничего о получателе не знает.
+message MessageStatusEvent {
+  string message_id = 1;
+  string conversation_id = 2;
+  // Пакет ушёл в оверлей, когда spanning-дерево знало маршрут до ключа.
+  bool written_to_overlay = 3;
+  // Получатель прислал DeliveryAckContent из открытого сеанса.
+  bool delivered = 4;
+  uint64 ack_timestamp_ms = 5;
+}
+
 message BackupProgressEvent {
   uint64 backup_id = 1;
   uint32 completed_chunks = 2;
@@ -340,5 +621,7 @@ message CoreEvent {
     IncomingMessageEvent incoming_message = 6;
     BackupProgressEvent backup_progress = 7;
     IncomingCallEvent incoming_call = 8;
+    MessageStatusEvent message_status = 9;
+    ContactResolvedEvent contact_updated = 10;
   }
 }

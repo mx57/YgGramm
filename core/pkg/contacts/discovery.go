@@ -1,4 +1,12 @@
 // File: core/pkg/contacts/discovery.go
+//
+// pkg/contacts — каркас без вызывающего: не импортируется ни pkg/rpc, ни cmd/*,
+// ни приложением (см. TestUnreachablePackagesMatchRegistry), тестов нет, и ни
+// одного обращения к DHT не выполнялось. ContactCard приходит в ядро единственным
+// путём: бандл, запрошенный у самого узла (FetchContact, Шаг 7), либо карта,
+// переданная вне сети. Импорт pkg/crypto настоящий, но живым пакета он его не
+// делает: crypto достижим и через pkg/rpc, а тут наоборот — вызывать
+// Kademlia/OPRF/@username некому.
 package contacts
 
 import (
@@ -37,9 +45,9 @@ type ContactCard struct {
 
 // DHTContactRecord stored in the distributed Kademlia table over Yggdrasil
 type DHTContactRecord struct {
-	Card      ContactCard `json:"card"`
-	TTL       time.Duration
-	CachedAt  time.Time
+	Card     ContactCard `json:"card"`
+	TTL      time.Duration
+	CachedAt time.Time
 }
 
 // ContactDiscoveryManager handles Kademlia DHT lookups, PSI address book matching, and Alfis DNS

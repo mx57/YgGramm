@@ -1,0 +1,7 @@
+version: v2
+plugins:
+  - local: protoc-gen-go
+    out: core/proto
+    opt: paths=source_relative
+  - local: protoc-gen-dart
+    out: app/lib/gen/yggproto

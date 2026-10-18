@@ -15,6 +15,25 @@ import (
 	"time"
 )
 
+// ГРУППОВАЯ ЧАСТЬ: ЭТО НЕ MLS, И ВЫЗЫВАЮЩЕГО У НЕГО НЕТ (Шаг 9-c).
+//
+// pkg/crypto достижим через pkg/rpc, поэтому реестр недостижимых пакетов этот
+// файл не ловит — за него отвечает TestGroupMlsFileHasNoCallers
+// (core/pkg/rpc/architecture_test.go): ни одно имя отсюда вне pkg/crypto не
+// упоминается. То есть группового кода в работающем ядре нет вовсе.
+//
+// Чем этот код является: симметричные цепочки отправки (sender keys) в духе
+// Signal с сменой эпохи. Чем не является: MLS и TreeKEM — дерева участников нет,
+// сообщений Welcome и Commit нет, RotateEpoch меняет случайный ключ и стирает
+// цепочки отправщиков, состояние живёт только в памяти, а в protobuf нет ни
+// одного группового сообщения — ни pkg/rpc, ни UI к этому не обращаются.
+// Поэтому и двойная галочка «групповой сеанс» в интерфейсе появиться не может:
+// подтверждать ей нечего.
+//
+// Чтобы часть стала рабочей, нужны все четыре вещи сразу: групповые сообщения в
+// контракте, писатель в pkg/rpc, экран в UI и тесты — и честное имя вместо «MLS»
+// в описаниях.
+
 // GroupRole defines privileges within an encrypted group
 type GroupRole int
 
@@ -67,12 +86,12 @@ type EncryptedGroupMessage struct {
 type GroupSession struct {
 	mu sync.RWMutex
 
-	GroupID        string
-	Epoch          uint64
-	MyDeviceID     string
-	MySigningKey   ed25519.PrivateKey
-	MyChainKey     []byte
-	MyIteration    uint32
+	GroupID      string
+	Epoch        uint64
+	MyDeviceID   string
+	MySigningKey ed25519.PrivateKey
+	MyChainKey   []byte
+	MyIteration  uint32
 
 	Members        map[string]*GroupMemberInfo // Key: DeviceID
 	SenderChains   map[string]*SenderKeyState  // Key: DeviceID

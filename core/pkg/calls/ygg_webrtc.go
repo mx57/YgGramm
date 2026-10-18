@@ -1,4 +1,18 @@
 // File: core/pkg/calls/ygg_webrtc.go
+//
+// pkg/calls — каркас без вызывающего: его не импортирует ни один достижимый от
+// cmd/* пакет (см. TestUnreachablePackagesMatchRegistry), тестов нет, в
+// protobuf нет ни одного сообщения звонка, а событие incoming_call ядро не
+// публикует никогда. Название не должно вводить в заблуждение: WebRTC здесь нет.
+//   - «SDP» собирается fmt.Sprintf: ни разбора описаний, ни ICE, ни DTLS, так что
+//     подключиться к такому предложению может только этот же пакет, а его не
+//     подключает никто;
+//   - SSRC захардкожен (0x12345678), а таймстемп RTP считается от системных
+//     часов, не по сетке 90 кГц, поэтому декодер кадр не примет;
+//   - приёмные колбэки некому назначить, поэтому кадр из readLoop до
+//     потребителя не дойдёт никогда;
+//   - счётчик fecRecovered не растёт: восстановлением потерянных пакетов здесь
+//     никто не занимается.
 package calls
 
 import (
@@ -55,24 +69,24 @@ const (
 
 // CallSignalPayload is serialized and sent inside the E2E Double Ratchet channel
 type CallSignalPayload struct {
-	CallID         string         `json:"call_id"`
-	Type           CallSignalType `json:"type"`
-	SDP            string         `json:"sdp"`
-	Candidate      string         `json:"candidate"`
-	AudioCodec     string         `json:"audio_codec"`      // "opus/48000/2"
-	VideoCodec     string         `json:"video_codec"`      // "VP9" or "AV1"
-	HasVideo       bool           `json:"has_video"`
-	ScreenSharing  bool           `json:"screen_sharing"`
-	UseInbandFEC   bool           `json:"use_inband_fec"`   // Forward Error Correction
-	MediaPort      int            `json:"media_port"`       // Yggdrasil IPv6 direct port
-	DirectIPv6     string         `json:"direct_ipv6"`      // Caller/Callee 200::/7 address
-	Timestamp      int64          `json:"timestamp"`
+	CallID        string         `json:"call_id"`
+	Type          CallSignalType `json:"type"`
+	SDP           string         `json:"sdp"`
+	Candidate     string         `json:"candidate"`
+	AudioCodec    string         `json:"audio_codec"` // "opus/48000/2"
+	VideoCodec    string         `json:"video_codec"` // "VP9" or "AV1"
+	HasVideo      bool           `json:"has_video"`
+	ScreenSharing bool           `json:"screen_sharing"`
+	UseInbandFEC  bool           `json:"use_inband_fec"` // Forward Error Correction
+	MediaPort     int            `json:"media_port"`     // Yggdrasil IPv6 direct port
+	DirectIPv6    string         `json:"direct_ipv6"`    // Caller/Callee 200::/7 address
+	Timestamp     int64          `json:"timestamp"`
 }
 
 // RTPPacket represents a standard Real-time Transport Protocol media frame
 type RTPPacket struct {
-	Version        byte   // 2
-	PayloadType    byte   // 111 (Opus), 96 (VP9)
+	Version        byte // 2
+	PayloadType    byte // 111 (Opus), 96 (VP9)
 	SequenceNumber uint16
 	Timestamp      uint32
 	SSRC           uint32
@@ -106,15 +120,15 @@ func UnmarshalRTPPacket(data []byte) (*RTPPacket, error) {
 
 // DirectMediaSession manages real-time UDP streams directly over Yggdrasil 200::/7
 type DirectMediaSession struct {
-	mu           sync.RWMutex
-	callID       string
-	localIPv6    string
-	remoteIPv6   string
-	localPort    int
-	remotePort   int
-	conn         *net.UDPConn
-	state        CallState
-	stopChan     chan struct{}
+	mu         sync.RWMutex
+	callID     string
+	localIPv6  string
+	remoteIPv6 string
+	localPort  int
+	remotePort int
+	conn       *net.UDPConn
+	state      CallState
+	stopChan   chan struct{}
 
 	// Metrics
 	audioSeq     uint32
@@ -185,13 +199,13 @@ func (cm *CallManager) InitiateCall(
 	assignedPort := udpConn.LocalAddr().(*net.UDPAddr).Port
 
 	session := &DirectMediaSession{
-		callID:       callID,
-		localIPv6:    cm.myYggIPv6,
-		remoteIPv6:   remoteIPv6,
-		localPort:    assignedPort,
-		conn:         udpConn,
-		state:        CallDialing,
-		stopChan:     make(chan struct{}),
+		callID:     callID,
+		localIPv6:  cm.myYggIPv6,
+		remoteIPv6: remoteIPv6,
+		localPort:  assignedPort,
+		conn:       udpConn,
+		state:      CallDialing,
+		stopChan:   make(chan struct{}),
 	}
 	cm.activeSession = session
 

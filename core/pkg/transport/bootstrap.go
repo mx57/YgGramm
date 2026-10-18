@@ -20,15 +20,15 @@ import (
 
 // BootstrapPeer represents a discovered peer candidate with transport metadata
 type BootstrapPeer struct {
-	URI             string
-	TransportMode   AntiDpiMode
-	TargetSNI       string
-	Source          string // "hardcoded", "doh_yandex", "doh_quad9", "dht_bep44"
-	Latency         time.Duration
-	LastSeen        time.Time
-	Failures        int
-	IsActive        bool
-	IsDomesticNode  bool
+	URI            string
+	TransportMode  AntiDpiMode
+	TargetSNI      string
+	Source         string // "hardcoded", "doh_yandex", "doh_quad9", "dht_bep44"
+	Latency        time.Duration
+	LastSeen       time.Time
+	Failures       int
+	IsActive       bool
+	IsDomesticNode bool
 }
 
 // DoHServer represents a DNS-over-HTTPS provider
@@ -86,8 +86,8 @@ func NewPeerManager(trustedKey ed25519.PublicKey, dialer *AntiDpiDialer) *PeerMa
 	}
 
 	transport := &http.Transport{
-		MaxIdleConns:        10,
-		IdleConnTimeout:     30 * time.Second,
+		MaxIdleConns:       10,
+		IdleConnTimeout:    30 * time.Second,
 		DisableCompression: false,
 		// Dial via custom Anti-DPI dialer to evade DoH blocking
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -350,9 +350,8 @@ func (pm *PeerManager) SelectBestPeer(ctx context.Context) (*BootstrapPeer, erro
 
 // GetPeersList returns a snapshot of all tracked bootstrap peers
 func (pm *PeerManager) GetPeersList() []BootstrapPeer {
-	pm.mu.RUnlock()
-	defer pm.mu.RUnlock()
 	pm.mu.RLock()
+	defer pm.mu.RUnlock()
 
 	result := make([]BootstrapPeer, 0, len(pm.peers))
 	for _, p := range pm.peers {

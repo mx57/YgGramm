@@ -1,4 +1,13 @@
 // File: core/pkg/media/swarm_transfer.go
+//
+// pkg/media — каркас без вызывающего: не импортируется (см.
+// TestUnreachablePackagesMatchRegistry), тестов нет. «Swarm» в названии — план, а
+// не код: роевой загрузки по QUIC и обмена чанками между пирами здесь нет, есть
+// обычный net/http GET без аутентификации и без проверки целостности скачанного.
+// quic-go лежит в зависимостях только как транзитивная часть yggdrasil, и этот
+// пакет его не импортирует. ComputeBlurHash не является blurhash: на пустом входе
+// константа, иначе — буква «L» и hex от SHA-256, который декодер blurhash не
+// разберёт.
 package media
 
 import (
@@ -34,16 +43,16 @@ type MediaChunkDescriptor struct {
 
 // MediaManifest represents the cryptographic descriptor shared in chat messages
 type MediaManifest struct {
-	FileID        string                 `json:"file_id"`
-	FileName      string                 `json:"file_name"`
-	MimeType      string                 `json:"mime_type"`
-	TotalBytes    uint64                 `json:"total_bytes"`
-	TotalChunks   uint32                 `json:"total_chunks"`
-	RootMerkle    string                 `json:"root_merkle"`
-	FileKey       []byte                 `json:"file_key"`   // 32 bytes AEAD key
-	NoncePrefix   []byte                 `json:"nonce_prefix"` // 8 bytes nonce prefix
-	BlurHash      string                 `json:"blur_hash"`   // Instant compact thumbnail
-	Chunks        []MediaChunkDescriptor `json:"chunks"`
+	FileID      string                 `json:"file_id"`
+	FileName    string                 `json:"file_name"`
+	MimeType    string                 `json:"mime_type"`
+	TotalBytes  uint64                 `json:"total_bytes"`
+	TotalChunks uint32                 `json:"total_chunks"`
+	RootMerkle  string                 `json:"root_merkle"`
+	FileKey     []byte                 `json:"file_key"`     // 32 bytes AEAD key
+	NoncePrefix []byte                 `json:"nonce_prefix"` // 8 bytes nonce prefix
+	BlurHash    string                 `json:"blur_hash"`    // Instant compact thumbnail
+	Chunks      []MediaChunkDescriptor `json:"chunks"`
 }
 
 // SwarmManager coordinates multi-threaded chunk downloading, seeding, and peer distribution

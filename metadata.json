@@ -1,6 +1,0 @@
-{
-  "name": "YggGram - Decentralized Anti-DPI Messenger",
-  "description": "Cross-platform decentralized messenger for Windows and Android over Yggdrasil overlay network with anti-DPI traffic masking, Userspace networking, and Dart FFI bridge.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}

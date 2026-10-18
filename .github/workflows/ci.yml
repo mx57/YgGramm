@@ -7,8 +7,8 @@ on:
     branches: [ main, master ]
 
 jobs:
-  check-go:
-    name: Check Go Core
+  go-core:
+    name: Go Core
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -17,44 +17,126 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: '1.25'
           cache-dependency-path: core/go.sum
 
-      - name: Go Vet
-        run: |
-          cd core
-          go vet ./...
+      - name: Verify dependencies
+        working-directory: core
+        run: go mod verify
 
-      - name: Go Test
-        run: |
-          cd core
-          go test -v ./...
+      - name: Vet
+        working-directory: core
+        run: go vet ./...
 
-  check-flutter:
-    name: Check Flutter App
+      - name: Test
+        working-directory: core
+        run: go test ./...
+
+      - name: Build userspace library (Linux, no CGO)
+        working-directory: core
+        run: go build ./...
+
+      - name: Cross-build ygggram.dll (Windows x64, c-shared)
+        working-directory: core
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mingw-w64
+          # -checklinkname=0: yggdrasil → quic-go → wlynxg/anet ссылается на
+          # неприватный net.zoneCache через //go:linkname, что линкер c-shared
+          # иначе отвергает.
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=1 CC=x86_64-w64-mingw32-gcc \
+            go build -buildmode=c-shared -ldflags=-checklinkname=0 -o build/ygggram.dll ./cmd/libygggram
+
+      - name: Cross-build libygggram.so (Android arm64-v8a, c-shared)
+        working-directory: core
+        run: |
+          NDK="${ANDROID_NDK_HOME:-$ANDROID_NDK_LATEST_HOME}"
+          CC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
+          GOOS=android GOARCH=arm64 CGO_ENABLED=1 \
+            go build -buildmode=c-shared -ldflags=-checklinkname=0 -o build/libygggram.so ./cmd/libygggram
+
+  proto-contract:
+    name: Protobuf contract
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Java
-        uses: actions/setup-java@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
-          distribution: 'zulu'
-          java-version: '17'
+          go-version: '1.25'
+
+      - name: Set up Dart
+        uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+
+      - name: Install buf, protoc-gen-go and protoc-gen-dart
+        run: |
+          go install github.com/bufbuild/buf/cmd/buf@v1.50.0
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.34.2
+          dart pub global activate protoc_plugin 25.1.0
+
+      - name: Regenerate Go and Dart bindings and fail on drift
+        run: |
+          # $(go env GOPATH)/bin и pub-cache кладём ПЕРЕД остальным PATH, чтобы buf
+          # гарантированно нашёл плагины, установленные этим workflow.
+          export PATH="$(go env GOPATH)/bin:$HOME/.pub-cache/bin:$PATH"
+          echo "buf: $(buf --version) <- $(command -v buf)"
+          echo "protoc-gen-go: $(protoc-gen-go --version) <- $(command -v protoc-gen-go)"
+          go version -m "$(command -v protoc-gen-go)" | sed -n '1,4p'
+          echo "protoc-gen-dart: $(command -v protoc-gen-dart)"
+          buf generate
+          # Сравнение — побайтное, кроме ПУСТЫХ comment-строк (`//`) в сгенерированном
+          # коде: их наличие решает не `.proto`, а Go-тулчейн, собравший protoc-gen-go
+          # (go/doc-comment-нормализация в Go 1.25 и Go 1.27 расходятся — измерено на
+          # прогонах 2026-10-18: один и тот же protobuf v1.34.2 печатает шапку
+          # одинаково, а списки oneof-вариантов — с пустой `//` строкой и без неё).
+          # Всё остальное — имена, поля, порядок, версия в шапке — по-прежнему
+          # сравнивается строго, и падение по-прежнему означает «запустите make proto».
+          drop_empty_comment() { sed -e '/^[[:space:]]*\/\/[[:space:]]*$/d'; }
+          drift=0
+          for f in $(git ls-files core/proto app/lib/gen); do
+            if ! diff -q <(drop_empty_comment < "$f") <(git show "HEAD:$f" | drop_empty_comment) > /dev/null; then
+              echo "дрейф: $f"
+              diff -u <(git show "HEAD:$f" | drop_empty_comment) <(drop_empty_comment < "$f") | head -40
+              drift=1
+            fi
+          done
+          extra=$(git ls-files --others --exclude-standard core/proto app/lib/gen)
+          if [ -n "$extra" ]; then
+            echo "дрейф: сгенерированные файлы отсутствуют в git:"
+            echo "$extra"
+            drift=1
+          fi
+          if [ "$drift" -ne 0 ]; then
+            echo "::error ::proto/ygggram.proto расходится со сгенерированным кодом. Запустите: make proto"
+            exit 1
+          fi
+          echo "стабы совпали с $(git ls-files core/proto app/lib/gen | wc -l) отслеживаемыми файлами (пустые comment-строки не считаются)"
+
+  flutter-app:
+    name: Flutter App
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
-          channel: 'stable'
+          channel: stable
           cache: true
 
       - name: Install dependencies
-        run: |
-          cd app
-          flutter pub get
+        working-directory: app
+        run: flutter pub get
 
-      - name: Flutter Analyze
-        run: |
-          cd app
-          flutter analyze
+      - name: Analyze (fails on any lint)
+        working-directory: app
+        run: flutter analyze --fatal-infos
+
+      - name: Test
+        working-directory: app
+        run: flutter test

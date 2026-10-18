@@ -1,4 +1,40 @@
 // File: core/pkg/transport/antidpi.go
+//
+// pkg/transport — каркас вне дата-пути, а не транспорт приложения. Вызывающий у
+// него появился на Шаге 16 и это измерительный вход cmd/tspuprobe: он собирает
+// отсюда ClientHello, считает им печатку из pkg/fingerprint и смотрит, на какой фазе
+// обрывается соединение. До pkg/rpc, pkg/yggnode и приложения байты отсюда не
+// доходят по-прежнему — это измеряет TestUnreachablePackagesMatchRegistry
+// (core/pkg/rpc/architecture_test.go), а не память. С Шага 2 рукопожатие ссылок
+// делает встроенная yggdrasil-go через crypto/tls и QUIC.
+//
+// Что обещано и чего в коде нет — построчно, чтобы файл не читался как описание
+// работающего обхода фильтров:
+//   - Фрагментация ClientHello на замерянной сети (Шаг 16, матрица
+//     «9 целей × 6 профилей × 3 прогона») работает против нас: там, где целый
+//     hello проходит 3/3, фрагментированный с SNI получает активный RST 0/3, а
+//     там, где дроп по SNI тихий, фрагментация не обходит его ни разу. Значит
+//     «разрезать hello» — не обход, а признак, по которому этот фильтр рвёт
+//     соединение; включение в дата-путь требует пересъёмки на целевой сети.
+//   - ModeUTLSChrome не эмулирует Chrome: зависимости refraction-networking/utls
+//     в go.mod нет, рукопожатие делает stdlib crypto/tls. Замер Шага 4-b тем же
+//     pkg/fingerprint даёт «голый» Go-клиент — без ALPN, без GREASE, одна
+//     TLS-запись версии 0x0301. Отличия от браузерного отпечатка лежат ровно в
+//     тех признаках, по которым такой трафик ищут.
+//   - dialShadowTLS — собственный протокол (8 байт времени, 16 байт соли,
+//     HMAC-SHA256 поверх них и ack «YG»), он несовместим с эталонным ShadowTLS v3
+//     и к чужим мостам не подключится.
+//   - Внешнее рукопожатие идёт с InsecureSkipVerify: true. Пока пакет вне
+//     дата-пути, это мёртвый код; включать его в живое соединение можно только
+//     вместе с реальной проверкой сертификата, иначе маскировка превращается в
+//     готовый канал для человека посередине.
+//   - TrafficMorpher (статистический паддинг и джиттер) не реализован вообще.
+//   - bootstrap.go (DoH, DHT BEP-44) не вызывается: пиры ядру отдаёт конфиг и
+//     multicast-обнаружение из pkg/yggnode.
+//
+// Чтобы пакет стал рабочим, нужно выбрать одну технику, подключить её к
+// link-конфигу yggnode вместо crypto/tls и замерить получившийся отпечаток, а не
+// описывать её в README как подключённую.
 package transport
 
 import (
@@ -168,30 +204,10 @@ func (d *AntiDpiDialer) dialFragmentedTLS(ctx context.Context, addr string, mode
 		splitPoint: splitPoint,
 	}
 
-	// Prepare TLS Config with Chrome-compatible ALPN and CipherSuites
-	alpnProtocols := []string{"h2", "http/1.1"}
-	if mode == ModeUTLSIOS {
-		alpnProtocols = []string{"h2", "http/1.1"}
-	}
-
-	tlsConfig := &tls.Config{
-		ServerName:         sni,
-		InsecureSkipVerify: true, // Verification is anchored to Yggdrasil Ed25519 node key inside payload
-		NextProtos:         alpnProtocols,
-		MinVersion:         tls.VersionTLS12,
-		MaxVersion:         tls.VersionTLS13,
-		CipherSuites: []uint16{
-			tls.TLS_AES_128_GCM_SHA256,
-			tls.TLS_AES_256_GCM_SHA384,
-			tls.TLS_CHACHA20_POLY1305_SHA256,
-			tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-			tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
-			tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-			tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
-			tls.TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
-			tls.TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256,
-		},
-	}
+	// Конфиг собирается тем же кодом, что и у замерки (probe.go): два отдельных
+	// описания tls.Config расходились бы молча, и измеряли бы «похожий»
+	// handshake, а не этот. ALPN и списки шифров прежние.
+	tlsConfig := clientTLSConfig(sni, []string{"h2", "http/1.1"}, true)
 
 	tlsClient := tls.Client(fragConn, tlsConfig)
 	handshakeDeadline := time.Now().Add(d.cfg.ConnectTimeout)

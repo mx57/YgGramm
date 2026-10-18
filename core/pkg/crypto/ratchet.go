@@ -18,13 +18,13 @@ import (
 
 // PreKeyBundle published by a recipient for asynchronous X3DH handshake
 type PreKeyBundle struct {
-	IdentityKey         *ecdh.PublicKey
-	IdentityEd25519     ed25519.PublicKey
-	SignedPreKey        *ecdh.PublicKey
-	SignedPreKeySig     []byte
-	OneTimePreKey       *ecdh.PublicKey
-	OneTimePreKeyID     uint32
-	Timestamp           int64
+	IdentityKey     *ecdh.PublicKey
+	IdentityEd25519 ed25519.PublicKey
+	SignedPreKey    *ecdh.PublicKey
+	SignedPreKeySig []byte
+	OneTimePreKey   *ecdh.PublicKey
+	OneTimePreKeyID uint32
+	Timestamp       int64
 }
 
 // X3DHHandshakeResult contains initial state for establishing a Double Ratchet session
@@ -32,6 +32,31 @@ type X3DHHandshakeResult struct {
 	SharedKey     []byte
 	EphemeralPub  *ecdh.PublicKey
 	UsedOneTimePK bool
+}
+
+// x3dhDomainSeparator — константа F из X3DH (§2.2 "Key derivation"): 32 байта
+// 0xFF для X25519 (для X448 та же редакция задаёт 57 байт 0xFF). F подмешивается
+// в ikm перед KM ради доменного разделения с XEdDSA. Без неё SK расходится с
+// эталонным X3DH даже когда DH1..DH4 совпадают байт в байт.
+var x3dhDomainSeparator = [32]byte{
+	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+	0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+}
+
+// x3dhKdf — KDF(KM) из спецификации: HKDF-Extract(salt = 0, ikm = F || KM),
+// затем HKDF-Expand; на выходе ровно 32 байта SK, из которого Double Ratchet
+// уже сам выводит ключи цепочек.
+func x3dhKdf(dhInput []byte) ([]byte, error) {
+	ikm := make([]byte, 0, len(x3dhDomainSeparator)+len(dhInput))
+	ikm = append(ikm, x3dhDomainSeparator[:]...)
+	ikm = append(ikm, dhInput...)
+	// §2.1 отдаёт hash и info на откуп приложению: здесь SHA-512 (salt — 64
+	// нуля, ровно «length equal to the hash output length», см. hkdfExtract)
+	// и ASCII-имя протокола. Из-за этого SK совпадёт с Signal-реализациями
+	// только при тех же параметрах, а сверки с libsignal не выполнялось.
+	return HKDFDerive(ikm, nil, "ygggram-x3dh-root-v1", 32)
 }
 
 // PerformX3DHInitiator computes the shared master secret from recipient's PreKeyBundle
@@ -87,8 +112,8 @@ func PerformX3DHInitiator(
 		usedOPK = true
 	}
 
-	// Derive 32-byte Root Shared Key via HKDF
-	sharedSecret, err := HKDFDerive(dhInput, nil, "ygggram-x3dh-root-v1", 32)
+	// SK = KDF(DH1 || DH2 || DH3 [|| DH4])
+	sharedSecret, err := x3dhKdf(dhInput)
 	if err != nil {
 		return nil, err
 	}
@@ -139,7 +164,9 @@ func PerformX3DHReceiver(
 		dhInput = append(dhInput, dh4...)
 	}
 
-	return HKDFDerive(dhInput, nil, "ygggram-x3dh-root-v1", 32)
+	// SK = KDF(DH1 || DH2 || DH3 [|| DH4]) — тот же x3dhKdf, что и на стороне
+	// отправителя, чтобы две ветки не разъехались при правке параметров.
+	return x3dhKdf(dhInput)
 }
 
 // -----------------------------------------------------------------------------
@@ -172,12 +199,12 @@ type DoubleRatchetSession struct {
 	dhrPublicKey  *ecdh.PublicKey
 
 	// Symmetric chains
-	rootKey          []byte
-	sendingChainKey  []byte
-	recvChainKey     []byte
-	sendSequence     uint32
-	recvSequence     uint32
-	prevChainLength  uint32
+	rootKey         []byte
+	sendingChainKey []byte
+	recvChainKey    []byte
+	sendSequence    uint32
+	recvSequence    uint32
+	prevChainLength uint32
 
 	// Skipped keys cache for out-of-order packets (Key: [32-byte DHR] + uint32 MsgNum)
 	skippedKeys map[string]SkippedKey
@@ -211,8 +238,8 @@ func NewInitiatorSession(sharedKey []byte, recipientDHPublic *ecdh.PublicKey) (*
 		rootKey:         newRK,
 		sendingChainKey: sendCK,
 		skippedKeys:     make(map[string]SkippedKey),
-		maxSkipped:      2000,
-		keyTTL:          7 * 24 * time.Hour,
+		maxSkipped:      maxSkippedKeys,
+		keyTTL:          skippedKeyTTL,
 	}, nil
 }
 
@@ -223,8 +250,8 @@ func NewReceiverSession(sharedKey []byte, myDHPrivate *ecdh.PrivateKey) *DoubleR
 		dhsPublicKey:  myDHPrivate.PublicKey(),
 		rootKey:       sharedKey,
 		skippedKeys:   make(map[string]SkippedKey),
-		maxSkipped:    2000,
-		keyTTL:        7 * 24 * time.Hour,
+		maxSkipped:    maxSkippedKeys,
+		keyTTL:        skippedKeyTTL,
 	}
 }
 
@@ -245,6 +272,19 @@ func kdfChainKey(ck []byte) (nextCK, messageKey []byte) {
 	mac.Write([]byte{0x02})
 	nextCK = mac.Sum(nil)
 	return nextCK, messageKey
+}
+
+// buildAD собирает associated data в отдельном буфере.
+// Прямой append(header.DHPublicKey, ...) недопустим: байты заголовка приходят
+// из одного сетевого среза, и дозапись портила nonce и ciphertext того же
+// сообщения — GCM возвращал "message authentication failed".
+func buildAD(dhPublicKey, associatedData []byte, messageNumber uint32) []byte {
+	out := make([]byte, 0, len(dhPublicKey)+len(associatedData)+4)
+	out = append(out, dhPublicKey...)
+	out = append(out, associatedData...)
+	var b4 [4]byte
+	binary.BigEndian.PutUint32(b4[:], messageNumber)
+	return append(out, b4[:]...)
 }
 
 // Encrypt ratchets the sending chain and encrypts plaintext using AEAD (AES-256-GCM)
@@ -282,10 +322,7 @@ func (s *DoubleRatchetSession) Encrypt(plaintext, associatedData []byte) (*Encry
 	}
 
 	// Associated data includes header fields to prevent tampering
-	headerAD := append(header.DHPublicKey, associatedData...)
-	var b4 [4]byte
-	binary.BigEndian.PutUint32(b4[:], header.MessageNumber)
-	headerAD = append(headerAD, b4[:]...)
+	headerAD := buildAD(header.DHPublicKey, associatedData, header.MessageNumber)
 
 	ciphertext := aead.Seal(nil, nonce, plaintext, headerAD)
 
@@ -328,10 +365,17 @@ func (s *DoubleRatchetSession) Decrypt(msg EncryptedRatchetMessage, associatedDa
 		}
 	}
 
-	// 3. Skip messages in current receiving chain if this message arrived out-of-order
+	// 3. Message numbers in a chain only move forward. A replayed or stale
+	//    number must be refused without touching the chain: consuming a key
+	//    for junk would make the next genuine message undecryptable.
+	if msg.Header.MessageNumber < s.recvSequence {
+		return nil, errors.New("ratchet: номер сообщения уже израсходован")
+	}
+
+	// 4. Skip messages in current receiving chain if this message arrived out-of-order
 	s.skipMessageKeys(msg.Header.MessageNumber)
 
-	// 4. Derive message key for current packet
+	// 5. Derive message key for current packet
 	nextCK, msgKey := kdfChainKey(s.recvChainKey)
 	s.recvChainKey = nextCK
 	s.recvSequence++
@@ -422,10 +466,7 @@ func (s *DoubleRatchetSession) decryptWithKey(msgKey []byte, msg EncryptedRatche
 		return nil, err
 	}
 
-	headerAD := append(msg.Header.DHPublicKey, associatedData...)
-	var b4 [4]byte
-	binary.BigEndian.PutUint32(b4[:], msg.Header.MessageNumber)
-	headerAD = append(headerAD, b4[:]...)
+	headerAD := buildAD(msg.Header.DHPublicKey, associatedData, msg.Header.MessageNumber)
 
 	return aead.Open(nil, msg.Nonce, msg.Ciphertext, headerAD)
 }

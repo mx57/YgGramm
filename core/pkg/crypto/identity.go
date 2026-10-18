@@ -5,70 +5,33 @@ import (
 	"crypto/ecdh"
 	"crypto/ed25519"
 	"crypto/hmac"
-	"crypto/rand"
 	"crypto/sha512"
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"strings"
 	"time"
+
+	"golang.org/x/crypto/pbkdf2"
+	"golang.org/x/text/unicode/norm"
 )
 
-// Standard BIP-39 wordlist snippet (essential 256 common seed words for deterministic encoding)
-var bip39WordList = []string{
-	"abandon", "ability", "able", "about", "above", "absent", "absorb", "abstract",
-	"absurd", "abuse", "access", "accident", "account", "accuse", "achieve", "acid",
-	"acoustic", "acquire", "across", "act", "action", "actor", "actress", "actual",
-	"adapt", "add", "addict", "address", "adjust", "admit", "adult", "advance",
-	"advice", "aerobic", "affair", "afford", "afraid", "again", "age", "agent",
-	"agree", "ahead", "aim", "air", "airport", "aisle", "alarm", "album",
-	"alcohol", "alert", "alien", "all", "alley", "allow", "almost", "alone",
-	"alpha", "already", "also", "alter", "always", "amateur", "amazing", "among",
-	"amount", "amused", "analyst", "anchor", "ancient", "anger", "angle", "angry",
-	"animal", "ankle", "announce", "annual", "another", "answer", "antenna", "antique",
-	"anxiety", "any", "apart", "apology", "appear", "apple", "approve", "april",
-	"arch", "arctic", "area", "arena", "argue", "arm", "armed", "armor",
-	"army", "around", "arrange", "arrest", "arrive", "arrow", "art", "artefact",
-	"artist", "artwork", "ask", "aspect", "assault", "asset", "assist", "assume",
-	"asthma", "athlete", "atom", "attack", "attend", "attitude", "attract", "auction",
-	"audit", "august", "aunt", "author", "auto", "autumn", "average", "avocado",
-	"avoid", "awake", "aware", "away", "awesome", "awful", "awkward", "axis",
-	"baby", "bachelor", "bacon", "badge", "bag", "balance", "balcony", "ball",
-	"bamboo", "banana", "banner", "bar", "barely", "bargain", "barrel", "base",
-	"basic", "basket", "battle", "beach", "bean", "beauty", "because", "become",
-	"beef", "before", "begin", "behave", "behind", "believe", "below", "belt",
-	"bench", "benefit", "best", "betray", "better", "between", "beyond", "bicycle",
-	"bid", "bike", "bind", "biology", "bird", "birth", "bitter", "black",
-	"blade", "blame", "blanket", "blast", "bleak", "bless", "blind", "blood",
-	"blossom", "blouse", "blue", "blur", "blush", "board", "boat", "body",
-	"boil", "bomb", "bone", "bonus", "book", "boost", "border", "boring",
-	"borrow", "boss", "bottom", "bounce", "box", "boy", "bracket", "brain",
-	"brand", "brass", "brave", "bread", "breeze", "brick", "bridge", "brief",
-	"bright", "bring", "brisk", "broccoli", "broken", "bronze", "broom", "brother",
-	"brown", "brush", "bubble", "buddy", "budget", "buffalo", "build", "bulb",
-	"bulk", "bullet", "bundle", "bunker", "burden", "burger", "burst", "bus",
-	"business", "busy", "butter", "buyer", "buzz", "cabbage", "cabin", "cable",
-	"cactus", "cage", "cake", "call", "calm", "camera", "camp", "can",
-	"canal", "cancel", "candy", "cannon", "canoe", "canvas", "canyon", "capable",
-}
-
-// MasterIdentity represents user root identity derived from BIP-39 mnemonic
+// MasterIdentity — корень личности пользователя, выведенный из фразы BIP-39.
 type MasterIdentity struct {
-	Mnemonic       string
-	Seed           []byte // 64 bytes (512 bits)
-	MasterEd25519  ed25519.PrivateKey
-	MasterX25519   *ecdh.PrivateKey
+	Mnemonic        string
+	Seed            []byte // 64 bytes (512 bits)
+	MasterEd25519   ed25519.PrivateKey
+	MasterX25519    *ecdh.PrivateKey
 	BackupMasterKey [32]byte
 }
 
 // DeviceCertificate binds a sub-device (e.g. Android phone or Windows PC) to the Master Identity
 type DeviceCertificate struct {
-	DeviceID        string             `json:"device_id"`
-	DeviceName      string             `json:"device_name"`
-	DeviceEd25519   ed25519.PublicKey  `json:"device_ed25519"`
-	DeviceX25519    []byte             `json:"device_x25519"`
-	CreatedAt       int64              `json:"created_at"`
-	MasterSignature []byte             `json:"master_signature"`
+	DeviceID        string            `json:"device_id"`
+	DeviceName      string            `json:"device_name"`
+	DeviceEd25519   ed25519.PublicKey `json:"device_ed25519"`
+	DeviceX25519    []byte            `json:"device_x25519"`
+	CreatedAt       int64             `json:"created_at"`
+	MasterSignature []byte            `json:"master_signature"`
 }
 
 // DeviceIdentity represents an active running device instance
@@ -116,85 +79,48 @@ func HKDFDerive(secret, salt []byte, info string, length int) ([]byte, error) {
 	return hkdfExpand(prk, []byte(info), length)
 }
 
-// PBKDF2-HMAC-SHA512 for BIP-39 seed generation (2048 rounds)
-func pbkdf2SHA512(password, salt []byte, iterations, keyLen int) []byte {
-	prf := hmac.New(sha512.New, password)
-	hashLen := prf.Size()
-	numBlocks := (keyLen + hashLen - 1) / hashLen
-
-	var result []byte
-	for block := 1; block <= numBlocks; block++ {
-		var blockBuf [4]byte
-		binary.BigEndian.PutUint32(blockBuf[:], uint32(block))
-
-		prf.Reset()
-		prf.Write(salt)
-		prf.Write(blockBuf[:])
-		u := prf.Sum(nil)
-
-		t := make([]byte, hashLen)
-		copy(t, u)
-
-		for iter := 1; iter < iterations; iter++ {
-			prf.Reset()
-			prf.Write(u)
-			u = prf.Sum(nil)
-			for i := 0; i < hashLen; i++ {
-				t[i] ^= u[i]
-			}
-		}
-
-		result = append(result, t...)
-	}
-
-	return result[:keyLen]
-}
-
-// GenerateMnemonic creates a new 12-word BIP-39 phrase with 128-bit cryptographic entropy
+// GenerateMnemonic — 12 слов, 128 бит энтропии из crypto/rand.
 func GenerateMnemonic() (string, error) {
-	entropy := make([]byte, 16) // 128 bits
-	if _, err := rand.Read(entropy); err != nil {
-		return "", err
-	}
-
-	words := make([]string, 12)
-	for i := 0; i < 12; i++ {
-		idx := int(entropy[i%len(entropy)]) % len(bip39WordList)
-		words[i] = bip39WordList[idx]
-	}
-
-	return strings.Join(words, " "), nil
+	return NewMnemonic(128)
 }
 
-// MasterIdentityFromMnemonic derives deterministic keys from BIP-39 mnemonic + optional passphrase
+// MasterIdentityFromMnemonic выводит ключи из фразы BIP-39 и опционального
+// passphrase. Фраза обязана пройти EntropyFromMnemonic: контрольная сумма —
+// единственное, что отличает опечатку в слове восстановления от «ключей нет», и
+// принимать её молча нельзя, потому что на неверной фразе выводятся вполне
+// настоящие, но чужие ключи и пользователь получает пустой аккаунт вместо
+// ошибки. Passphrase нормализуется по NFKD, как требует спецификация, — иначе
+// одна и та же фраза в разных кошельках дала бы разные seed.
 func MasterIdentityFromMnemonic(mnemonic, passphrase string) (*MasterIdentity, error) {
-	trimmed := strings.TrimSpace(mnemonic)
-	words := strings.Fields(trimmed)
-	if len(words) != 12 && len(words) != 24 {
-		return nil, errors.New("mnemonic must contain exactly 12 or 24 words")
+	if _, err := EntropyFromMnemonic(mnemonic); err != nil {
+		return nil, err
 	}
+	trimmed := NormalizeMnemonic(mnemonic)
 
-	salt := []byte("mnemonic" + passphrase)
-	seed := pbkdf2SHA512([]byte(trimmed), salt, 2048, 64)
+	salt := "mnemonic" + norm.NFKD.String(passphrase)
+	seed := pbkdf2.Key([]byte(trimmed), []byte(salt), bip39Pbkdf2Rounds, 64, sha512.New)
 
-	// Derive Master Ed25519 Seed (m/44'/9999'/0')
+	// Мастер-Ed25519: HKDF с доменной строкой, а не путь BIP-32. Разделение
+	// областей здесь делает info, поэтому ни одна из трёх ниже ветвей не
+	// совпадает по байтам с деривацией кошелька на том же seed — фраза
+	// совместима с внешними программами на уровне seed, а не на уровне ключей.
 	edSeed, err := HKDFDerive(seed, nil, "ygggram-master-ed25519-v1", 32)
 	if err != nil {
 		return nil, err
 	}
 	masterEd := ed25519.NewKeyFromSeed(edSeed)
 
-	// Derive Master X25519 Key (m/44'/9999'/1')
 	xSeed, err := HKDFDerive(seed, nil, "ygggram-master-x25519-v1", 32)
 	if err != nil {
 		return nil, err
 	}
 	masterX, err := ecdh.X25519().NewPrivateKey(xSeed)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create x25519 private key: %w", err)
+		return nil, fmt.Errorf("crypto: мастер-X25519 из seed: %w", err)
 	}
 
-	// Derive Cloud Backup Master Key (m/44'/9999'/3')
+	// Ключ облачного бэкапа выводится из того же seed отдельной доменной
+	// строкой: скомпрометированный бэкап не должен давать мастер-ключи личности.
 	backupKeyBytes, err := HKDFDerive(seed, nil, "ygggram-backup-master-key-v1", 32)
 	if err != nil {
 		return nil, err

@@ -1,4 +1,11 @@
 // File: core/pkg/channels/dag_channel.go
+//
+// pkg/channels — каркас без вызывающего: не импортируется (см.
+// TestUnreachablePackagesMatchRegistry), тестов нет. Подписанный Merkle-DAG тут
+// собран корректно, но живёт только в памяти процесса: транспорта для gossip нет
+// (GenerateGossipSyncMessage собирает сообщение, которое некому отправить), в
+// protobuf нет ни одного сообщения канала, а на диске состояние не держится
+// (пакет не работает с файлами вовсе), так что синхронизировать две копии нечем.
 package channels
 
 import (
@@ -15,16 +22,16 @@ import (
 
 // PostNode represents a vertex in the cryptographically signed Merkle-DAG
 type PostNode struct {
-	PostID       string            `json:"post_id"` // CID: SHA-256(canonical JSON)
-	ChannelID    string            `json:"channel_id"`
-	AuthorPub    ed25519.PublicKey `json:"author_pub"`
-	Sequence     uint64            `json:"sequence"`
-	ParentIDs    []string          `json:"parent_ids"` // Merkle causal parents
-	Timestamp    int64             `json:"timestamp"`
-	Title        string            `json:"title"`
-	Body         string            `json:"body"`
-	MediaLinks   []string          `json:"media_links"` // Manifest CIDs
-	Signature    []byte            `json:"signature"`
+	PostID     string            `json:"post_id"` // CID: SHA-256(canonical JSON)
+	ChannelID  string            `json:"channel_id"`
+	AuthorPub  ed25519.PublicKey `json:"author_pub"`
+	Sequence   uint64            `json:"sequence"`
+	ParentIDs  []string          `json:"parent_ids"` // Merkle causal parents
+	Timestamp  int64             `json:"timestamp"`
+	Title      string            `json:"title"`
+	Body       string            `json:"body"`
+	MediaLinks []string          `json:"media_links"` // Manifest CIDs
+	Signature  []byte            `json:"signature"`
 }
 
 // ChannelMetadata describes a public or private broadcast channel
@@ -39,20 +46,20 @@ type ChannelMetadata struct {
 
 // GossipMessage wraps DAG synchronization packets between peers
 type GossipMessage struct {
-	Topic     string     `json:"topic"`
-	HeadCIDs  []string   `json:"head_cids"`
-	NewPosts  []PostNode `json:"new_posts"`
-	SenderID  string     `json:"sender_id"`
+	Topic    string     `json:"topic"`
+	HeadCIDs []string   `json:"head_cids"`
+	NewPosts []PostNode `json:"new_posts"`
+	SenderID string     `json:"sender_id"`
 }
 
 // DAGChannelManager coordinates the Merkle-DAG, post verification, and Gossipsub relaying
 type DAGChannelManager struct {
-	mu           sync.RWMutex
-	channels     map[string]*ChannelMetadata
-	posts        map[string]*PostNode        // PostID -> PostNode
-	heads        map[string]map[string]bool  // ChannelID -> Set of leaf PostIDs
-	subscribers  map[string]map[string]bool  // ChannelID -> Set of peer IPv6s
-	onNewPostCb  func(post PostNode)
+	mu          sync.RWMutex
+	channels    map[string]*ChannelMetadata
+	posts       map[string]*PostNode       // PostID -> PostNode
+	heads       map[string]map[string]bool // ChannelID -> Set of leaf PostIDs
+	subscribers map[string]map[string]bool // ChannelID -> Set of peer IPv6s
+	onNewPostCb func(post PostNode)
 }
 
 // NewDAGChannelManager initializes a Merkle-DAG channel manager

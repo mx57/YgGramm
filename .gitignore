@@ -1,11 +1,14 @@
-node_modules/
 build/
-dist/
-coverage/
 .DS_Store
 *.log
 .env*
-!.env.example
+
+# Артефакты ядра: libygggram.so/ygggram.dll пересобираются скриптами
+app/android/app/src/main/jniLibs/*/libygggram.so
+app/windows/runner/assets/ygggram.dll
+core/build/
+.gradle/
+local.properties
 
 # Flutter / Dart ignores
 .dart_tool/

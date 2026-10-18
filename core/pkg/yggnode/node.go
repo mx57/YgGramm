@@ -1,623 +1,463 @@
 // File: core/pkg/yggnode/node.go
+//
+// Узел оверлея Yggdrasil. Реализован поверх настоящей yggdrasil-go
+// (github.com/yggdrasil-network/yggdrasil-go/src/core), поэтому адреса,
+// рукопожатия и формат пакетов wire-совместимы с публичной сетью: к ноде
+// можно пироваться настоящими `yggdrasil`-демонами и через публичные мосты.
+//
+// TUN/Wintun не используется: пакеты ходят через Core.ReadFrom/WriteTo
+// (userspace, без root).
 package yggnode
 
 import (
 	"bytes"
-	"context"
 	"crypto/ed25519"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"net/url"
+	"os"
+	"regexp"
 	"sync"
-	"sync/atomic"
 	"time"
 
-	"ygggram/core/pkg/transport"
+	iwt "github.com/Arceliar/ironwood/types"
+	gl "github.com/gologme/log"
+	yggaddr "github.com/yggdrasil-network/yggdrasil-go/src/address"
+	yggcfg "github.com/yggdrasil-network/yggdrasil-go/src/config"
+	yggcore "github.com/yggdrasil-network/yggdrasil-go/src/core"
+	yggmc "github.com/yggdrasil-network/yggdrasil-go/src/multicast"
 )
 
-const (
-	// Yggdrasil Address Allocation: 0200::/7
-	YggdrasilPrefixByte0 = 0x02
-	YggdrasilPrefixByte1 = 0x00
+// DefaultListenPort — порт, который YggGram держит открытым для входящих
+// пирований по умолчанию.
+const DefaultListenPort = 54321
 
-	// Multicast LAN Discovery parameters
-	MulticastIPv4Group = "239.255.255.250:54328"
-	MulticastIPv6Group = "[ff02::1]:54328"
-	DiscoveryBeaconMagic = 0x5947474C // 'YGGL'
-
-	// Multiplexer Frame Types
-	FrameTypeStreamOpen = 0x01
-	FrameTypeStreamData = 0x02
-	FrameTypeStreamFin  = 0x03
-	FrameTypeStreamRst  = 0x04
-	FrameTypeKeepalive  = 0x05
-)
-
-// YggNode represents an embedded userspace Yggdrasil overlay node
-type YggNode struct {
-	mu           sync.RWMutex
-	nodePrivKey  ed25519.PrivateKey
-	nodePubKey   ed25519.PublicKey
-	nodeIPv6     net.IP
-	listenPort   int
-	dataDir      string
-	cacheDir     string
-	isRunning    bool
-	stopChan     chan struct{}
-
-	// Userspace Overlay Transport
-	packetConn   *OverlayPacketConn
-	streamMux    *OverlayStreamMux
-	peerManager  *transport.PeerManager
-	antiDpiDialer *transport.AntiDpiDialer
-
-	// Multicast discovery
-	lanPeers     map[string]*LANPeer
-	lanMu        sync.RWMutex
-
-	// Stats
-	rxBytes      uint64
-	txBytes      uint64
-	startedAt    time.Time
-}
-
-// LANPeer represents an automatically discovered local Wi-Fi / Hotspot peer
-type LANPeer struct {
-	IPv6        net.IP
-	IPPort      string
-	PublicKey   ed25519.PublicKey
-	LastBeacon  time.Time
-	IsDirectLAN bool
-}
-
-// NodeOptions holds startup parameters for the userspace node
+// NodeOptions — параметры запуска userspace-узла.
 type NodeOptions struct {
-	PrivateKey   ed25519.PrivateKey
-	ListenPort   int
-	DataDir      string
-	CacheDir     string
-	AntiDpiMode  transport.AntiDpiMode
-	TargetSNI    string
-	SeedPeers    []string
+	// PrivateKey — Ed25519-ключ ноды, выведенный из мнемоники. yggdrasil
+	// строит из него и self-signed сертификат, и IPv6-адрес.
+	PrivateKey ed25519.PrivateKey
+
+	// Listen — URI вида "tcp://[::]:54321", "tls://0.0.0.0:443",
+	// "wss://[::]:443", "quic://[::]:443". Пусто — только исходящие соединения.
+	Listen []string
+
+	// Peers — постоянные пиры в той же URI-форме ("tcp://1.2.3.4:54321").
+	Peers []string
+
+	// GroupPassword — приватная подсеть: узлы без такого же пароля не получат
+	// от нас трафик.
+	GroupPassword string
+
+	// Multicast — wire-совместимое LAN-обнаружение Yggdrasil (ff02::114:9001).
+	Multicast bool
+
+	// NodeInfo — необязательная видимая сети информация (имя, версия).
+	NodeInfo map[string]interface{}
 }
 
-// DeriveYggIPv6 computes the deterministic Yggdrasil IPv6 address from an Ed25519 public key
-func DeriveYggIPv6(pubKey ed25519.PublicKey) net.IP {
-	hash := sha256.Sum256(pubKey)
-	ip := make(net.IP, 16)
-	ip[0] = YggdrasilPrefixByte0
-	ip[1] = YggdrasilPrefixByte1
-	copy(ip[2:], hash[:14])
-	return ip
+// PeerStatus — состояние пиров-соединения, взятое из ноды yggdrasil.
+type PeerStatus struct {
+	URI       string
+	Up        bool
+	Inbound   bool
+	Latency   time.Duration
+	Uptime    time.Duration
+	RXBytes   uint64
+	TXBytes   uint64
+	RemoteKey ed25519.PublicKey
+	LastError string
 }
 
-// NewYggNode initializes the userspace node with anti-DPI dialer and deterministic crypto keys
-func NewYggNode(opts NodeOptions) (*YggNode, error) {
-	priv := opts.PrivateKey
-	if priv == nil {
-		_, p, err := ed25519.GenerateKey(rand.Reader)
-		if err != nil {
-			return nil, fmt.Errorf("failed to generate ed25519 node key: %w", err)
-		}
-		priv = p
-	}
+// YggNode — обёртка над *yggcore.Core с userspace-доступом к пакетам.
+type YggNode struct {
+	core          *yggcore.Core
+	multicast     *yggmc.Multicast
+	logger        *gl.Logger
+	wantMulticast bool
+	startedAt     time.Time
+	stopped       bool
 
-	pub := priv.Public().(ed25519.PublicKey)
-	yggIP := DeriveYggIPv6(pub)
-
-	if opts.ListenPort <= 0 {
-		opts.ListenPort = 54321
-	}
-
-	antiDpiCfg := transport.DefaultAntiDpiConfig()
-	antiDpiCfg.Mode = opts.AntiDpiMode
-	if opts.TargetSNI != "" {
-		antiDpiCfg.TargetSNI = opts.TargetSNI
-	}
-
-	dialer := transport.NewAntiDpiDialer(antiDpiCfg)
-	peerManager := transport.NewPeerManager(pub, dialer)
-
-	for _, peerURI := range opts.SeedPeers {
-		peerManager.AddSeedPeer(peerURI, "config", false)
-	}
-
-	node := &YggNode{
-		nodePrivKey:   priv,
-		nodePubKey:    pub,
-		nodeIPv6:      yggIP,
-		listenPort:    opts.ListenPort,
-		dataDir:       opts.DataDir,
-		cacheDir:      opts.CacheDir,
-		stopChan:      make(chan struct{}),
-		antiDpiDialer: dialer,
-		peerManager:   peerManager,
-		lanPeers:      make(map[string]*LANPeer),
-	}
-
-	// Create custom Userspace PacketConn (No root, No TUN/Wintun)
-	pktConn := newOverlayPacketConn(yggIP, node)
-	node.packetConn = pktConn
-	node.streamMux = newOverlayStreamMux(pktConn)
-
-	return node, nil
+	// Входящие пакеты: read-насос раздаёт их подписчикам. Без подписчика насос
+	// всё равно должен крутиться — иначе встанет и отправка.
+	inboundMu sync.Mutex
+	inbound   map[int]chan Packet
+	nextSub   int
 }
 
-// Start begins overlay routing, background peer health-checking, and LAN multicast discovery
-func (n *YggNode) Start(ctx context.Context) error {
-	n.mu.Lock()
-	if n.isRunning {
-		n.mu.Unlock()
-		return errors.New("node is already running")
-	}
-	n.isRunning = true
-	n.startedAt = time.Now()
-	n.mu.Unlock()
-
-	// Launch LAN Multicast Beacon & Discovery Listener
-	go n.runLANDiscoveryBeacon()
-	go n.runLANDiscoveryListener()
-
-	// Launch Peer Health Probe & Failover Loop
-	go n.runPeerMaintenanceLoop()
-
-	return nil
-}
-
-// Stop gracefully terminates node streams, discovery beacons, and connections
-func (n *YggNode) Stop() error {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	if !n.isRunning {
+// AddressForKey возвращает IPv6 узла Yggdrasil по его Ed25519-ключу — ровно
+// так же, как эталонная реализация (0200::/7 + старшие биты инвертированного
+// ключа).
+func AddressForKey(pub ed25519.PublicKey) net.IP {
+	a := yggaddr.AddrForKey(pub)
+	if a == nil {
 		return nil
 	}
-	n.isRunning = false
-	close(n.stopChan)
+	return net.IP(a[:])
+}
 
-	if n.packetConn != nil {
-		_ = n.packetConn.Close()
+// SubnetForKey возвращает /64-подсеть, маршрутизируемую на ключ узла.
+func SubnetForKey(pub ed25519.PublicKey) *net.IPNet {
+	s := yggaddr.SubnetForKey(pub)
+	if s == nil {
+		return nil
+	}
+	base := make([]byte, 16)
+	copy(base, s[:])
+	return &net.IPNet{IP: net.IP(base), Mask: net.CIDRMask(64, 128)}
+}
+
+// AddrForPublicKey превращает ключ узла в адрес для записи в PacketConn:
+// yggdrasil адресует сессии по Ed25519-ключу, а не по IPv6.
+func AddrForPublicKey(pub ed25519.PublicKey) net.Addr {
+	if len(pub) != ed25519.PublicKeySize {
+		return nil
+	}
+	key := make([]byte, ed25519.PublicKeySize)
+	copy(key, pub)
+	return iwt.Addr(key)
+}
+
+// NewYggNode собирает и запускает ноду yggdrasil. Ошибка возвращается, если
+// ключ негодный или URI разборены криво: молча игнорировать кривой конфиг
+// нельзя — пользователь увидит «онлайн» без сети.
+func NewYggNode(opts NodeOptions) (*YggNode, error) {
+	if len(opts.PrivateKey) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("yggnode: ключ ноды должен быть ed25519 (%d байт), получено %d",
+			ed25519.PrivateKeySize, len(opts.PrivateKey))
 	}
 
-	return nil
-}
-
-// NodeIPv6 returns the 200::/7 Yggdrasil IPv6 address
-func (n *YggNode) NodeIPv6() net.IP {
-	return n.nodeIPv6
-}
-
-// PublicKey returns the Ed25519 identity key
-func (n *YggNode) PublicKey() ed25519.PublicKey {
-	return n.nodePubKey
-}
-
-// -----------------------------------------------------------------------------
-// USERSPACE PACKETCONN (net.PacketConn implementation)
-// -----------------------------------------------------------------------------
-
-// OverlayPacketConn routes packets inside the Userspace Yggdrasil network
-type OverlayPacketConn struct {
-	localIP    net.IP
-	node       *YggNode
-	inboundCh  chan packetRecord
-	closed     bool
-	mu         sync.RWMutex
-}
-
-type packetRecord struct {
-	payload []byte
-	from    net.Addr
-}
-
-type YggAddr struct {
-	IP net.IP
-}
-
-func (a *YggAddr) Network() string { return "yggdrasil-userspace" }
-func (a *YggAddr) String() string  { return a.IP.String() }
-
-func newOverlayPacketConn(localIP net.IP, node *YggNode) *OverlayPacketConn {
-	return &OverlayPacketConn{
-		localIP:   localIP,
-		node:      node,
-		inboundCh: make(chan packetRecord, 1024),
+	cfg := yggcfg.NodeConfig{PrivateKey: yggcfg.KeyBytes(opts.PrivateKey)}
+	if err := cfg.GenerateSelfSignedCertificate(); err != nil {
+		return nil, fmt.Errorf("yggnode: self-signed сертификат ноды: %w", err)
 	}
-}
-
-func (c *OverlayPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
-	c.mu.RLock()
-	if c.closed {
-		c.mu.RUnlock()
-		return 0, nil, io.ErrClosedPipe
+	// ed25519 принимает любые 64 байта, не проверяя согласование половин. Если
+	// приватная часть не соответствует публичной, узел получит адрес, под
+	// который сеть не примет его подпись, — ловим это до старта.
+	probe := []byte("yggnode:key-consistency")
+	sig := ed25519.Sign(opts.PrivateKey, probe)
+	if !ed25519.Verify(opts.PrivateKey.Public().(ed25519.PublicKey), probe, sig) {
+		return nil, errors.New("yggnode: приватная и публичная части ключа ноды не согласованы")
 	}
-	c.mu.RUnlock()
 
-	select {
-	case pkt, ok := <-c.inboundCh:
-		if !ok {
-			return 0, nil, io.ErrClosedPipe
+	coreOpts := make([]yggcore.SetupOption, 0, len(opts.Listen)+len(opts.Peers)+2)
+	for _, l := range opts.Listen {
+		uri, err := normalizeURI(l)
+		if err != nil {
+			return nil, fmt.Errorf("yggnode: слушатель %q: %w", l, err)
 		}
-		n := copy(p, pkt.payload)
-		return n, pkt.from, nil
-	case <-c.node.stopChan:
-		return 0, nil, io.ErrClosedPipe
+		coreOpts = append(coreOpts, yggcore.ListenAddress(uri))
 	}
-}
-
-func (c *OverlayPacketConn) WriteTo(p []byte, addr net.Addr) (int, error) {
-	c.mu.RLock()
-	if c.closed {
-		c.mu.RUnlock()
-		return 0, io.ErrClosedPipe
-	}
-	c.mu.RUnlock()
-
-	atomic.AddUint64(&c.node.txBytes, uint64(len(p)))
-
-	// Check if destination is a local LAN peer
-	targetIPStr := addr.String()
-	c.node.lanMu.RLock()
-	lanPeer, isLAN := c.node.lanPeers[targetIPStr]
-	c.node.lanMu.RUnlock()
-
-	if isLAN && lanPeer != nil {
-		// Deliver directly over local UDP
-		udpAddr, err := net.ResolveUDPAddr("udp", lanPeer.IPPort)
-		if err == nil {
-			rawConn, dialErr := net.DialUDP("udp", nil, udpAddr)
-			if dialErr == nil {
-				defer rawConn.Close()
-				return rawConn.Write(p)
-			}
+	for _, p := range opts.Peers {
+		uri, err := normalizePeerURI(p)
+		if err != nil {
+			return nil, fmt.Errorf("yggnode: пир %q: %w", p, err)
 		}
+		coreOpts = append(coreOpts, yggcore.Peer{URI: uri})
+	}
+	if opts.GroupPassword != "" {
+		coreOpts = append(coreOpts, yggcore.GroupPassword(opts.GroupPassword))
+	}
+	if opts.NodeInfo != nil {
+		coreOpts = append(coreOpts, yggcore.NodeInfo(opts.NodeInfo))
 	}
 
-	// Otherwise, deliver through overlay mesh
-	return len(p), nil
+	logger := newLogger()
+	core, err := yggcore.New(cfg.Certificate, logger, coreOpts...)
+	if err != nil {
+		return nil, fmt.Errorf("yggnode: запуск ядра yggdrasil: %w", err)
+	}
+
+	return &YggNode{
+		core:          core,
+		logger:        logger,
+		wantMulticast: opts.Multicast,
+		inbound:       make(map[int]chan Packet),
+	}, nil
 }
 
-func (c *OverlayPacketConn) Close() error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if !c.closed {
-		c.closed = true
-		close(c.inboundCh)
+// Start отмечает время запуска, поднимает read-насос и LAN-мультикаст.
+// Слушатели и пиры yggdrasil стартуют вместе с ядром, в NewYggNode.
+//
+// Насос обязателен: ironwood отдаёт входящие кадры только пока кто-то зовёт
+// ReadFrom (канал приёмного буфера ёмкостью 1), и без читателя на НАШЕЙ
+// стороне не устанавливается даже сессия, то есть отправка молча стоит.
+// Проверено экспериментально: без насоса пакет не доходит ни одним способом.
+func (n *YggNode) Start() error {
+	if !n.startedAt.IsZero() {
+		return errors.New("yggnode: узел уже запущен")
 	}
+	n.startedAt = time.Now()
+	go n.readPump()
+
+	if !n.wantMulticast {
+		return nil
+	}
+	mc, err := yggmc.New(n.core, n.logger, yggmc.MulticastInterface{
+		Regex:  regexp.MustCompile(".*"),
+		Beacon: true,
+		Listen: true,
+	})
+	if err != nil {
+		return fmt.Errorf("yggnode: LAN-мультикаст: %w", err)
+	}
+	n.multicast = mc
 	return nil
 }
 
-func (c *OverlayPacketConn) LocalAddr() net.Addr                { return &YggAddr{IP: c.localIP} }
-func (c *OverlayPacketConn) SetDeadline(t time.Time) error      { return nil }
-func (c *OverlayPacketConn) SetReadDeadline(t time.Time) error  { return nil }
-func (c *OverlayPacketConn) SetWriteDeadline(t time.Time) error { return nil }
-
-// InjectInbound delivers incoming decrypted wire packets into the userspace stack
-func (c *OverlayPacketConn) InjectInbound(payload []byte, from net.Addr) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	if c.closed {
-		return
-	}
-
-	atomic.AddUint64(&c.node.rxBytes, uint64(len(payload)))
-
-	select {
-	case c.inboundCh <- packetRecord{payload: payload, from: from}:
-	default:
-		// Drop on congestion to avoid blocking network I/O
-	}
-}
-
-// -----------------------------------------------------------------------------
-// MULTIPLEXED OVERLAY STREAMS (Zero-Root Multiplexer)
-// -----------------------------------------------------------------------------
-
-// OverlayStream represents a bidirectional stream between two Yggdrasil nodes
-type OverlayStream struct {
-	streamID   uint32
-	remoteIP   net.IP
-	inboundCh  chan []byte
-	mux        *OverlayStreamMux
-	closed     bool
-	mu         sync.Mutex
-}
-
-func (s *OverlayStream) Read(b []byte) (int, error) {
-	chunk, ok := <-s.inboundCh
-	if !ok {
-		return 0, io.EOF
-	}
-	return copy(b, chunk), nil
-}
-
-func (s *OverlayStream) Write(b []byte) (int, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed {
-		return 0, io.ErrClosedPipe
-	}
-	return s.mux.writeFrame(s.streamID, s.remoteIP, FrameTypeStreamData, b)
-}
-
-func (s *OverlayStream) Close() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if !s.closed {
-		s.closed = true
-		_, _ = s.mux.writeFrame(s.streamID, s.remoteIP, FrameTypeStreamFin, nil)
-		s.mux.removeStream(s.streamID)
-	}
-	return nil
-}
-
-// OverlayStreamMux routes multiplexed frames across the OverlayPacketConn
-type OverlayStreamMux struct {
-	pktConn  *OverlayPacketConn
-	streams  map[uint32]*OverlayStream
-	acceptCh chan *OverlayStream
-	streamID uint32
-	mu       sync.RWMutex
-}
-
-func newOverlayStreamMux(pktConn *OverlayPacketConn) *OverlayStreamMux {
-	mux := &OverlayStreamMux{
-		pktConn:  pktConn,
-		streams:  make(map[uint32]*OverlayStream),
-		acceptCh: make(chan *OverlayStream, 64),
-	}
-	go mux.readDispatchLoop()
-	return mux
-}
-
-func (m *OverlayStreamMux) OpenStream(targetIP net.IP) (*OverlayStream, error) {
-	id := atomic.AddUint32(&m.streamID, 1)
-	st := &OverlayStream{
-		streamID:  id,
-		remoteIP:  targetIP,
-		inboundCh: make(chan []byte, 128),
-		mux:       m,
-	}
-
-	m.mu.Lock()
-	m.streams[id] = st
-	m.mu.Unlock()
-
-	// Send Open Frame
-	_, err := m.writeFrame(id, targetIP, FrameTypeStreamOpen, nil)
-	if err != nil {
-		m.removeStream(id)
-		return nil, err
-	}
-	return st, nil
-}
-
-func (m *OverlayStreamMux) AcceptStream() (*OverlayStream, error) {
-	st, ok := <-m.acceptCh
-	if !ok {
-		return nil, io.ErrClosedPipe
-	}
-	return st, nil
-}
-
-func (m *OverlayStreamMux) removeStream(id uint32) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	delete(m.streams, id)
-}
-
-func (m *OverlayStreamMux) writeFrame(id uint32, targetIP net.IP, frameType byte, data []byte) (int, error) {
-	buf := make([]byte, 0, 9+len(data))
-	// Header: Stream ID (4 bytes) + Frame Type (1 byte) + Data Len (4 bytes)
-	var b4 [4]byte
-	binary.BigEndian.PutUint32(b4[:], id)
-	buf = append(buf, b4[:]...)
-	buf = append(buf, frameType)
-	binary.BigEndian.PutUint32(b4[:], uint32(len(data)))
-	buf = append(buf, b4[:]...)
-	buf = append(buf, data...)
-
-	_, err := m.pktConn.WriteTo(buf, &YggAddr{IP: targetIP})
-	if err != nil {
-		return 0, err
-	}
-	return len(data), nil
-}
-
-func (m *OverlayStreamMux) readDispatchLoop() {
-	buf := make([]byte, 65535)
+// readPump читает пакеты оверлея, пока ядро не закрыто. Ошибка (в т.ч.
+// types.ErrClosed после Stop) завершает цикл.
+func (n *YggNode) readPump() {
+	buf := make([]byte, n.MTU()+1)
 	for {
-		n, addr, err := m.pktConn.ReadFrom(buf)
+		n2, from, err := n.core.ReadFrom(buf)
 		if err != nil {
 			return
 		}
-		if n < 9 {
+		key, ok := from.(iwt.Addr)
+		if !ok || len(key) != ed25519.PublicKeySize || n2 == 0 {
 			continue
 		}
-
-		streamID := binary.BigEndian.Uint32(buf[0:4])
-		frameType := buf[4]
-		dataLen := binary.BigEndian.Uint32(buf[5:9])
-
-		if int(9+dataLen) > n {
-			continue
+		pkt := Packet{
+			From:    append([]byte(nil), key...),
+			Payload: append([]byte(nil), buf[:n2]...),
 		}
-		payload := make([]byte, dataLen)
-		copy(payload, buf[9:9+dataLen])
-
-		m.mu.Lock()
-		st, exists := m.streams[streamID]
-		if !exists && frameType == FrameTypeStreamOpen {
-			// Inbound new stream
-			var remoteIP net.IP
-			if yggAddr, ok := addr.(*YggAddr); ok {
-				remoteIP = yggAddr.IP
-			}
-			st = &OverlayStream{
-				streamID:  streamID,
-				remoteIP:  remoteIP,
-				inboundCh: make(chan []byte, 128),
-				mux:       m,
-			}
-			m.streams[streamID] = st
+		n.inboundMu.Lock()
+		for _, ch := range n.inbound {
 			select {
-			case m.acceptCh <- st:
+			case ch <- pkt:
 			default:
+				// Подписчик не справляется: дешевле сбросить, чем тормозить
+				// сетевой ввод всего узла.
 			}
 		}
-		m.mu.Unlock()
+		n.inboundMu.Unlock()
+	}
+}
 
-		if st != nil {
-			if frameType == FrameTypeStreamData {
-				select {
-				case st.inboundCh <- payload:
-				default:
-				}
-			} else if frameType == FrameTypeStreamFin {
-				close(st.inboundCh)
-				m.removeStream(streamID)
-			}
+// Packet — кадр, пришедший из оверлея. From — Ed25519-ключ узла-отправителя
+// (это и есть адрес сессии ironwood), Payload — байты, записанные отправителем
+// через WriteTo.
+type Packet struct {
+	From    ed25519.PublicKey
+	Payload []byte
+}
+
+// Subscribe подписывает вызывающего на входящие пакеты. Вернувшаяся функция
+// отписывает; после отписки канал больше не получает пакетов. Буфер size —
+// сколько пакетов переживёт паузу подписчика, остальное отбрасывается.
+func (n *YggNode) Subscribe(size int) (<-chan Packet, func()) {
+	if size <= 0 {
+		size = 64
+	}
+	ch := make(chan Packet, size)
+	n.inboundMu.Lock()
+	id := n.nextSub
+	n.nextSub++
+	n.inbound[id] = ch
+	n.inboundMu.Unlock()
+
+	return ch, func() {
+		n.inboundMu.Lock()
+		if _, ok := n.inbound[id]; ok {
+			delete(n.inbound, id)
+			close(ch)
+		}
+		n.inboundMu.Unlock()
+	}
+}
+
+// Stop гасит мультикаст и ядро.
+func (n *YggNode) Stop() error {
+	if n.stopped {
+		return nil
+	}
+	n.stopped = true
+	if n.multicast != nil {
+		if err := n.multicast.Stop(); err != nil {
+			return fmt.Errorf("yggnode: остановка мультикаста: %w", err)
 		}
 	}
+	n.core.Stop()
+	return nil
+}
+
+// NodeIPv6 — адрес узла в 0200::/7, вычисленный yggdrasil из ключа ноды.
+func (n *YggNode) NodeIPv6() net.IP { return n.core.Address() }
+
+// PublicKey — Ed25519-ключ ноды: он же адрес сессии для записи в PacketConn.
+func (n *YggNode) PublicKey() ed25519.PublicKey { return n.core.PublicKey() }
+
+// MTU — максимальный размер полезной нагрузки пакета оверлея.
+func (n *YggNode) MTU() uint64 { return n.core.MTU() }
+
+// PacketConn отдаёт userspace-доступ к сети без TUN.
+func (n *YggNode) PacketConn() *PacketConn { return &PacketConn{core: n.core} }
+
+// Peers — реальный список пиров с состоянием соединения.
+func (n *YggNode) Peers() []PeerStatus {
+	infos := n.core.GetPeers()
+	out := make([]PeerStatus, 0, len(infos))
+	for _, p := range infos {
+		status := PeerStatus{
+			URI:       p.URI,
+			Up:        p.Up,
+			Inbound:   p.Inbound,
+			Latency:   p.Latency,
+			Uptime:    p.Uptime,
+			RXBytes:   p.RXBytes,
+			TXBytes:   p.TXBytes,
+			RemoteKey: p.Key,
+		}
+		if p.LastError != nil {
+			status.LastError = p.LastError.Error()
+		}
+		out = append(out, status)
+	}
+	return out
+}
+
+// AddPeer добавляет постоянный пир в рантайме: yggdrasil сама переподключится
+// при обрыве.
+func (n *YggNode) AddPeer(uri string) error {
+	u, err := normalizePeerURI(uri)
+	if err != nil {
+		return fmt.Errorf("yggnode: пир %q: %w", uri, err)
+	}
+	parsed, err := url.Parse(u)
+	if err != nil {
+		return fmt.Errorf("yggnode: разбор URI пира: %w", err)
+	}
+	if err := n.core.AddPeer(parsed, ""); err != nil {
+		return fmt.Errorf("yggnode: AddPeer(%s): %w", u, err)
+	}
+	return nil
+}
+
+// RemovePeer вычёркивает постоянного пира и рвёт уже поднятый линк: ядро
+// yggdrasil отменяет контекст линка и закрывает соединение, поэтому повторы
+// после вызова не возвращаются. URI нормализуется ровно так же, как в AddPeer,
+// — линк ищется по строке URI, и различие в схеме или дополненном порте
+// означало бы «пира нет», хотя он стоит.
+//
+// Отданной наружно ссылки это не касается: принятое соединение приходит со
+// стороны собеседника, и его адрес мы не конфигурировали. Для него yggdrasil
+// отвечает ErrLinkNotConfigured.
+func (n *YggNode) RemovePeer(uri string) error {
+	u, err := normalizePeerURI(uri)
+	if err != nil {
+		return fmt.Errorf("yggnode: пир %q: %w", uri, err)
+	}
+	parsed, err := url.Parse(u)
+	if err != nil {
+		return fmt.Errorf("yggnode: разбор URI пира: %w", err)
+	}
+	if err := n.core.RemovePeer(parsed, ""); err != nil {
+		return fmt.Errorf("yggnode: RemovePeer(%s): %w", u, err)
+	}
+	return nil
+}
+
+// Uptime — сколько живёт нода (0 до Start).
+func (n *YggNode) Uptime() time.Duration {
+	if n.startedAt.IsZero() {
+		return 0
+	}
+	return time.Since(n.startedAt)
+}
+
+// RoutingEntries — сколько узлов известно spanning-дереву этой ноды. Это не
+// «соседи», а записей маршрутизации: 0 у изолированной ноды.
+func (n *YggNode) RoutingEntries() uint64 {
+	return uint64(n.core.GetSelf().RoutingEntries)
+}
+
+// HasRouteTo отвечает на вопрос «знает ли оверлей, куда слать пакет этому ключу».
+// WriteTo в ironwood всегда принимает пакет (он лишь заводит сессию), поэтому
+// без этой проверки ядро выдавало бы «доставлено» там, где маршрута нет.
+// Учтите: это знание о маршруте, а не квитанция от получателя.
+func (n *YggNode) HasRouteTo(pub ed25519.PublicKey) bool {
+	if len(pub) != ed25519.PublicKeySize {
+		return false
+	}
+	for _, t := range n.core.GetTree() {
+		if bytes.Equal(t.Key, pub) {
+			return true
+		}
+	}
+	return false
 }
 
 // -----------------------------------------------------------------------------
-// LAN MULTICAST DISCOVERY (DIRECT PEER-TO-PEER WITHOUT INTERNET)
+// USERSPACE PACKETCONN
 // -----------------------------------------------------------------------------
 
-func (n *YggNode) runLANDiscoveryBeacon() {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-
-	udpAddr, err := net.ResolveUDPAddr("udp4", MulticastIPv4Group)
-	if err != nil {
-		return
-	}
-
-	conn, err := net.DialUDP("udp4", nil, udpAddr)
-	if err != nil {
-		return
-	}
-	defer conn.Close()
-
-	for {
-		select {
-		case <-n.stopChan:
-			return
-		case <-ticker.C:
-			// Beacon format: Magic (4) + Yggdrasil IPv6 (16) + Listen Port (2) + PubKey (32)
-			beacon := make([]byte, 0, 54)
-			var m4 [4]byte
-			binary.BigEndian.PutUint32(m4[:], DiscoveryBeaconMagic)
-			beacon = append(beacon, m4[:]...)
-			beacon = append(beacon, n.nodeIPv6...)
-
-			var p2 [2]byte
-			binary.BigEndian.PutUint16(p2[:], uint16(n.listenPort))
-			beacon = append(beacon, p2[:]...)
-			beacon = append(beacon, n.nodePubKey...)
-
-			_, _ = conn.Write(beacon)
-		}
-	}
+// PacketConn — чтение/запись пакетов оверлея поверх ядра yggdrasil. Адрес
+// получателя — iwt.Addr(Ed25519 ключ ноды), см. AddrForPublicKey.
+type PacketConn struct {
+	core *yggcore.Core
 }
 
-func (n *YggNode) runLANDiscoveryListener() {
-	udpAddr, err := net.ResolveUDPAddr("udp4", MulticastIPv4Group)
-	if err != nil {
-		return
-	}
+func (c *PacketConn) ReadFrom(p []byte) (int, net.Addr, error) { return c.core.ReadFrom(p) }
 
-	listener, err := net.ListenMulticastUDP("udp4", nil, udpAddr)
-	if err != nil {
-		return
-	}
-	defer listener.Close()
+func (c *PacketConn) WriteTo(p []byte, addr net.Addr) (int, error) { return c.core.WriteTo(p, addr) }
 
-	buf := make([]byte, 256)
-	for {
-		select {
-		case <-n.stopChan:
-			return
-		default:
-		}
-
-		_ = listener.SetReadDeadline(time.Now().Add(2 * time.Second))
-		bytesRead, srcAddr, err := listener.ReadFromUDP(buf)
-		if err != nil {
-			continue
-		}
-
-		if bytesRead < 54 {
-			continue
-		}
-
-		magic := binary.BigEndian.Uint32(buf[0:4])
-		if magic != DiscoveryBeaconMagic {
-			continue
-		}
-
-		peerIPv6 := net.IP(make([]byte, 16))
-		copy(peerIPv6, buf[4:20])
-
-		// Ignore own beacon
-		if bytes.Equal(peerIPv6, n.nodeIPv6) {
-			continue
-		}
-
-		peerPort := binary.BigEndian.Uint16(buf[20:22])
-		peerPubKey := make([]byte, 32)
-		copy(peerPubKey, buf[22:54])
-
-		// Verified valid Yggdrasil address derivation from reported pubkey
-		expectedIP := DeriveYggIPv6(peerPubKey)
-		if !bytes.Equal(peerIPv6, expectedIP) {
-			continue // Spoofed address detected, drop
-		}
-
-		ipStr := srcAddr.IP.String()
-		directAddress := fmt.Sprintf("%s:%d", ipStr, peerPort)
-
-		n.lanMu.Lock()
-		n.lanPeers[peerIPv6.String()] = &LANPeer{
-			IPv6:        peerIPv6,
-			IPPort:      directAddress,
-			PublicKey:   peerPubKey,
-			LastBeacon:  time.Now(),
-			IsDirectLAN: true,
-		}
-		n.lanMu.Unlock()
-	}
+// LocalAddr — наш собственный адрес в оверлее.
+func (c *PacketConn) LocalAddr() net.Addr {
+	return &net.IPAddr{IP: c.core.Address()}
 }
 
-func (n *YggNode) runPeerMaintenanceLoop() {
-	ticker := time.NewTicker(30 * time.Second)
-	defer ticker.Stop()
+// -----------------------------------------------------------------------------
+// helpers
+// -----------------------------------------------------------------------------
 
-	for {
-		select {
-		case <-n.stopChan:
-			return
-		case <-ticker.C:
-			// Trigger discovery and failover check
-			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			_, _ = n.peerManager.SelectBestPeer(ctx)
-			cancel()
-		}
-	}
+// normalizeURI проверяет транспорт и наличие host:port для слушателя: пустой
+// хост здесь означает «bind на всех интерфейсах» и легален, а вот порт
+// обязателен — иначе ядро подняло бы ничего не принимающий узел.
+func normalizeURI(raw string) (string, error) {
+	return normalizeEndpoint(raw, false)
 }
 
-// GetStatusSummary returns operational metrics for host integration
-func (n *YggNode) GetStatusSummary() (string, int, uint64, uint64) {
-	n.lanMu.RLock()
-	lanCount := len(n.lanPeers)
-	n.lanMu.RUnlock()
+// normalizePeerURI строже: пиру нужен конкретный адрес, "tcp://:54321" — это
+// не адрес пира, а забытый хост.
+func normalizePeerURI(raw string) (string, error) {
+	return normalizeEndpoint(raw, true)
+}
 
-	rx := atomic.LoadUint64(&n.rxBytes)
-	tx := atomic.LoadUint64(&n.txBytes)
-	return n.nodeIPv6.String(), lanCount, rx, tx
+func normalizeEndpoint(raw string, needHost bool) (string, error) {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return "", err
+	}
+	switch u.Scheme {
+	case "tcp", "tls", "socks", "ws", "wss", "quic":
+	default:
+		return "", fmt.Errorf("неизвестный транспорт %q (ожидается tcp/tls/socks/ws/wss/quic)", u.Scheme)
+	}
+	if u.Host == "" {
+		return "", errors.New("пустой host:port")
+	}
+	if u.Port() == "" {
+		return "", fmt.Errorf("в %q нет порта", raw)
+	}
+	if needHost && u.Hostname() == "" {
+		return "", fmt.Errorf("в %q нет адреса пира", raw)
+	}
+	return u.String(), nil
+}
+
+func newLogger() *gl.Logger {
+	w := io.Discard
+	if os.Getenv("YGGGRAM_DEBUG") != "" {
+		w = os.Stderr
+	}
+	l := gl.New(w, "yggnode: ", 0)
+	if os.Getenv("YGGGRAM_DEBUG") != "" {
+		for _, lvl := range []string{"error", "warn", "info", "debug"} {
+			l.EnableLevel(lvl)
+		}
+	}
+	return l
 }

@@ -1,4 +1,14 @@
 // File: core/pkg/delivery/wakeup_push.go
+//
+// pkg/delivery — каркас без вызывающего: не импортируется (см.
+// TestUnreachablePackagesMatchRegistry), тестов нет, и сквозного сценария
+// «сообщение разбудило устройство» не проверялось. Android-приёмник
+// PushWakeupReceiver берёт wakelock и поднимает фоновый сервис, но ядро не будит:
+// путь к сети у сервиса общий, а не через пуш. Обезличенного шлюза в коде нет —
+// пост идёт на http://[…]:54330/api/v1/blind_wake, которого в репозитории не
+// реализовано. С Шага 6 S&F-релея здесь больше нет: sf_relay.go удалён, потому что
+// врал, а настоящий слепой store-and-forward живёт в pkg/rpc/sf.go и ходит через
+// оверлей.
 package delivery
 
 import (
@@ -25,23 +35,23 @@ const (
 
 // WakeupConfig holds registration and endpoint tokens for push gateways
 type WakeupConfig struct {
-	ActiveProvider       WakeupProvider
-	UnifiedPushEndpoint  string // e.g. "https://ntfy.sh/ygggram-blind-xyz" or self-hosted ntfy/gotify
-	FCMProxyGatewayIPv6  string // Yggdrasil IPv6 of anonymized FCM gateway
-	FCMPushToken         string // Blind token from client
-	MinKeepaliveSeconds  int    // e.g. 20s when active
-	MaxKeepaliveSeconds  int    // e.g. 600s in deep Doze mode
+	ActiveProvider      WakeupProvider
+	UnifiedPushEndpoint string // e.g. "https://ntfy.sh/ygggram-blind-xyz" or self-hosted ntfy/gotify
+	FCMProxyGatewayIPv6 string // Yggdrasil IPv6 of anonymized FCM gateway
+	FCMPushToken        string // Blind token from client
+	MinKeepaliveSeconds int    // e.g. 20s when active
+	MaxKeepaliveSeconds int    // e.g. 600s in deep Doze mode
 }
 
 // WakeupManager coordinates cross-provider zero-payload wakeups and polling
 type WakeupManager struct {
-	mu           sync.RWMutex
-	cfg          WakeupConfig
-	httpClient   *http.Client
-	isScreenOn   bool
-	isPowerSaver bool
+	mu              sync.RWMutex
+	cfg             WakeupConfig
+	httpClient      *http.Client
+	isScreenOn      bool
+	isPowerSaver    bool
 	currentInterval time.Duration
-	stopPollChan chan struct{}
+	stopPollChan    chan struct{}
 }
 
 // NewWakeupManager creates a push wakeup coordinator
