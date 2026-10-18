@@ -80,21 +80,41 @@ jobs:
 
       - name: Regenerate Go and Dart bindings and fail on drift
         run: |
-          # $(go env GOPATH)/bin и pub-cache кладём ПЕРЕД остальным PATH: buf ищет
-          # плагины в PATH, и если в образе раннера уже лежит другой protoc-gen-go,
-          # он выигрывает у установленного этим workflow — тогда шаг падает на
-          # «дрейфе», которого в контракте нет, а есть только разница версий
-          # генератора. Версии печатаются в лог ровно поэтому.
+          # $(go env GOPATH)/bin и pub-cache кладём ПЕРЕД остальным PATH, чтобы buf
+          # гарантированно нашёл плагины, установленные этим workflow.
           export PATH="$(go env GOPATH)/bin:$HOME/.pub-cache/bin:$PATH"
           echo "buf: $(buf --version) <- $(command -v buf)"
           echo "protoc-gen-go: $(protoc-gen-go --version) <- $(command -v protoc-gen-go)"
+          go version -m "$(command -v protoc-gen-go)" | sed -n '1,4p'
           echo "protoc-gen-dart: $(command -v protoc-gen-dart)"
           buf generate
-          if ! git diff --exit-code core/proto/ app/lib/gen/; then
+          # Сравнение — побайтное, кроме ПУСТЫХ comment-строк (`//`) в сгенерированном
+          # коде: их наличие решает не `.proto`, а Go-тулчейн, собравший protoc-gen-go
+          # (go/doc-comment-нормализация в Go 1.25 и Go 1.27 расходятся — измерено на
+          # прогонах 2026-10-18: один и тот же protobuf v1.34.2 печатает шапку
+          # одинаково, а списки oneof-вариантов — с пустой `//` строкой и без неё).
+          # Всё остальное — имена, поля, порядок, версия в шапке — по-прежнему
+          # сравнивается строго, и падение по-прежнему означает «запустите make proto».
+          drop_empty_comment() { sed -e '/^[[:space:]]*\/\/[[:space:]]*$/d'; }
+          drift=0
+          for f in $(git ls-files core/proto app/lib/gen); do
+            if ! diff -q <(drop_empty_comment < "$f") <(git show "HEAD:$f" | drop_empty_comment) > /dev/null; then
+              echo "дрейф: $f"
+              diff -u <(git show "HEAD:$f" | drop_empty_comment) <(drop_empty_comment < "$f") | head -40
+              drift=1
+            fi
+          done
+          extra=$(git ls-files --others --exclude-standard core/proto app/lib/gen)
+          if [ -n "$extra" ]; then
+            echo "дрейф: сгенерированные файлы отсутствуют в git:"
+            echo "$extra"
+            drift=1
+          fi
+          if [ "$drift" -ne 0 ]; then
             echo "::error ::proto/ygggram.proto расходится со сгенерированным кодом. Запустите: make proto"
-            git diff --stat core/proto/ app/lib/gen/
             exit 1
           fi
+          echo "стабы совпали с $(git ls-files core/proto app/lib/gen | wc -l) отслеживаемыми файлами (пустые comment-строки не считаются)"
 
   flutter-app:
     name: Flutter App
