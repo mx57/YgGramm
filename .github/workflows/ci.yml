@@ -80,7 +80,15 @@ jobs:
 
       - name: Regenerate Go and Dart bindings and fail on drift
         run: |
-          export PATH="$PATH:$(go env GOPATH)/bin:$HOME/.pub-cache/bin"
+          # $(go env GOPATH)/bin и pub-cache кладём ПЕРЕД остальным PATH: buf ищет
+          # плагины в PATH, и если в образе раннера уже лежит другой protoc-gen-go,
+          # он выигрывает у установленного этим workflow — тогда шаг падает на
+          # «дрейфе», которого в контракте нет, а есть только разница версий
+          # генератора. Версии печатаются в лог ровно поэтому.
+          export PATH="$(go env GOPATH)/bin:$HOME/.pub-cache/bin:$PATH"
+          echo "buf: $(buf --version) <- $(command -v buf)"
+          echo "protoc-gen-go: $(protoc-gen-go --version) <- $(command -v protoc-gen-go)"
+          echo "protoc-gen-dart: $(command -v protoc-gen-dart)"
           buf generate
           if ! git diff --exit-code core/proto/ app/lib/gen/; then
             echo "::error ::proto/ygggram.proto расходится со сгенерированным кодом. Запустите: make proto"
