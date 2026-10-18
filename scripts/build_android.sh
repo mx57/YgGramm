@@ -17,6 +17,10 @@ echo "[*] Android API Level: ${ANDROID_API_LEVEL}"
 
 # Locate Android NDK
 if [[ -z "${ANDROID_NDK_HOME:-}" && -z "${ANDROID_NDK_ROOT:-}" ]]; then
+    if [[ -z "${ANDROID_HOME:-}" ]]; then
+        SDK_DIR="$(grep -E '^sdk\.dir=' "${PROJECT_ROOT}/app/android/local.properties" 2>/dev/null | cut -d= -f2- | tr -d '\\\r' )"
+        [[ -n "${SDK_DIR}" ]] && export ANDROID_HOME="${SDK_DIR}"
+    fi
     if [[ -d "${ANDROID_HOME:-}/ndk" ]]; then
         # Pick the latest installed NDK version
         LATEST_NDK=$(ls -d "${ANDROID_HOME}/ndk/"* 2>/dev/null | sort -V | tail -n 1)
@@ -36,9 +40,11 @@ echo "[*] Using NDK: ${NDK_PATH}"
 
 # Detect host OS for prebuilt toolchain
 HOST_OS="linux-x86_64"
-if [[ "$OSTYPE" == "darwin"* ]]; then
-    HOST_OS="darwin-x86_64"
-fi
+CLANG_SUFFIX=""
+case "${OSTYPE}" in
+    darwin*)  HOST_OS="darwin-x86_64" ;;
+    msys*|cygwin*|mingw*) HOST_OS="windows-x86_64"; CLANG_SUFFIX=".cmd" ;;
+esac
 
 TOOLCHAIN="${NDK_PATH}/toolchains/llvm/prebuilt/${HOST_OS}"
 if [[ ! -d "${TOOLCHAIN}" ]]; then
@@ -67,8 +73,8 @@ case "${TARGET_ABI}" in
         ;;
 esac
 
-CC_BIN="${TOOLCHAIN}/bin/${TARGET_TRIPLE}${ANDROID_API_LEVEL}-clang"
-CXX_BIN="${TOOLCHAIN}/bin/${TARGET_TRIPLE}${ANDROID_API_LEVEL}-clang++"
+CC_BIN="${TOOLCHAIN}/bin/${TARGET_TRIPLE}${ANDROID_API_LEVEL}-clang${CLANG_SUFFIX}"
+CXX_BIN="${TOOLCHAIN}/bin/${TARGET_TRIPLE}${ANDROID_API_LEVEL}-clang++${CLANG_SUFFIX}"
 
 if [[ ! -f "${CC_BIN}" ]]; then
     echo "[!] Error: Clang cross-compiler not found: ${CC_BIN}"
@@ -84,17 +90,22 @@ mkdir -p "${JNILIBS_TARGET}"
 OUTPUT_SO="${BUILD_OUT}/libygggram.so"
 
 echo "[*] Compiling ${OUTPUT_SO} with CGO..."
-cd "${PROJECT_ROOT}"
+# go.mod живёт в core/, поэтому сборку запускаем именно оттуда
+cd "${PROJECT_ROOT}/core"
 
+# -checklinkname=0 обязателен: yggdrasil тянет quic-go, а тот — github.com/wlynxg/anet,
+# который делает //go:linkname к неприватному net.zoneCache. В -buildmode=c-shared
+# линкер Go это запрещает («invalid reference to net.zoneCache»), остальные сборки
+# проходят и без флага.
 CGO_ENABLED=1 \
 GOOS=android \
 GOARCH="${GOARCH}" \
 CC="${CC_BIN}" \
 CXX="${CXX_BIN}" \
 go build -buildmode=c-shared \
-    -ldflags="-s -w -X main.Version=1.0.0-android -extldflags '-Wl,-soname,libygggram.so'" \
+    -ldflags="-s -w -checklinkname=0 -X main.Version=1.0.0-android -extldflags '-Wl,-soname,libygggram.so'" \
     -o "${OUTPUT_SO}" \
-    ./core/cmd/libygggram
+    ./cmd/libygggram
 
 echo "[✓] Built: ${OUTPUT_SO}"
 

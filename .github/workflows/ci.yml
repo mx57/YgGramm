@@ -7,8 +7,8 @@ on:
     branches: [ main, master ]
 
 jobs:
-  check-go:
-    name: Check Go Core
+  go-core:
+    name: Go Core
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
@@ -17,44 +17,98 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.23'
+          go-version: '1.25'
           cache-dependency-path: core/go.sum
 
-      - name: Go Vet
-        run: |
-          cd core
-          go vet ./...
+      - name: Verify dependencies
+        working-directory: core
+        run: go mod verify
 
-      - name: Go Test
-        run: |
-          cd core
-          go test -v ./...
+      - name: Vet
+        working-directory: core
+        run: go vet ./...
 
-  check-flutter:
-    name: Check Flutter App
+      - name: Test
+        working-directory: core
+        run: go test ./...
+
+      - name: Build userspace library (Linux, no CGO)
+        working-directory: core
+        run: go build ./...
+
+      - name: Cross-build ygggram.dll (Windows x64, c-shared)
+        working-directory: core
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mingw-w64
+          # -checklinkname=0: yggdrasil → quic-go → wlynxg/anet ссылается на
+          # неприватный net.zoneCache через //go:linkname, что линкер c-shared
+          # иначе отвергает.
+          GOOS=windows GOARCH=amd64 CGO_ENABLED=1 CC=x86_64-w64-mingw32-gcc \
+            go build -buildmode=c-shared -ldflags=-checklinkname=0 -o build/ygggram.dll ./cmd/libygggram
+
+      - name: Cross-build libygggram.so (Android arm64-v8a, c-shared)
+        working-directory: core
+        run: |
+          NDK="${ANDROID_NDK_HOME:-$ANDROID_NDK_LATEST_HOME}"
+          CC="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android24-clang" \
+          GOOS=android GOARCH=arm64 CGO_ENABLED=1 \
+            go build -buildmode=c-shared -ldflags=-checklinkname=0 -o build/libygggram.so ./cmd/libygggram
+
+  proto-contract:
+    name: Protobuf contract
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Java
-        uses: actions/setup-java@v4
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
-          distribution: 'zulu'
-          java-version: '17'
+          go-version: '1.25'
+
+      - name: Set up Dart
+        uses: dart-lang/setup-dart@v1
+        with:
+          sdk: stable
+
+      - name: Install buf, protoc-gen-go and protoc-gen-dart
+        run: |
+          go install github.com/bufbuild/buf/cmd/buf@v1.50.0
+          go install google.golang.org/protobuf/cmd/protoc-gen-go@v1.34.2
+          dart pub global activate protoc_plugin 25.1.0
+
+      - name: Regenerate Go and Dart bindings and fail on drift
+        run: |
+          export PATH="$PATH:$(go env GOPATH)/bin:$HOME/.pub-cache/bin"
+          buf generate
+          if ! git diff --exit-code core/proto/ app/lib/gen/; then
+            echo "::error proto/ygggram.proto расходится со сгенерированным кодом. Запустите: make proto"
+            git diff --stat core/proto/ app/lib/gen/
+            exit 1
+          }
+
+  flutter-app:
+    name: Flutter App
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
-          channel: 'stable'
+          channel: stable
           cache: true
 
       - name: Install dependencies
-        run: |
-          cd app
-          flutter pub get
+        working-directory: app
+        run: flutter pub get
 
-      - name: Flutter Analyze
-        run: |
-          cd app
-          flutter analyze
+      - name: Analyze (fails on any lint)
+        working-directory: app
+        run: flutter analyze --fatal-infos
+
+      - name: Test
+        working-directory: app
+        run: flutter test
