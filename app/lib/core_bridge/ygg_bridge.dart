@@ -3,7 +3,35 @@ import 'dart:async';
 import 'dart:ffi';
 import 'dart:io';
 import 'dart:typed_data';
+
 import 'package:ffi/ffi.dart';
+import 'package:fixnum/fixnum.dart' as $fixnum;
+import 'package:ygggram/gen/yggproto/ygggram.pb.dart';
+
+export 'package:ygggram/gen/yggproto/ygggram.pb.dart'
+    show
+        AntiDpiMode,
+        AntiDpiStatusEvent,
+        ChatMessage,
+        ChatMessage_Content,
+        ContactCard,
+        ContactResolvedEvent,
+        ConversationInfo,
+        CoreEvent,
+        CoreRequest,
+        CoreResponse,
+        FetchContactResp,
+        NetworkStatusEvent,
+        NodeConfig,
+        NodeStatusResp,
+        PeerInfo,
+        PeerListResp,
+        PeerListUpdatedEvent,
+        PreKeyBundle,
+        PeerTransportType,
+        SendMessageReq,
+        SendMessageResp,
+        TextContent;
 
 // Native function typedefs for C-ABI interoperability
 typedef CInitCore = Int32 Function(Pointer<Uint8> configBytes, Int32 length);
@@ -31,39 +59,73 @@ typedef DartInvokeCommand = int Function(
 typedef CFreeMemory = Void Function(Pointer<Uint8> ptr);
 typedef DartFreeMemory = void Function(Pointer<Uint8> ptr);
 
-/// High-level event types emitted by Go Core into Dart Stream
+/// Типы событий, которые ядро присылает в поток [YggCoreBridge.eventStream].
 enum CoreEventType {
   networkStatus,
   peersUpdated,
   antiDpiStatus,
   incomingMessage,
+  messageStatus,
   backupProgress,
   incomingCall,
+  contactUpdated,
   unknown,
 }
 
-/// Generic container for incoming CoreEvent
-class CoreEvent {
-  final int eventId;
-  final int timestampMs;
+/// Обёртка над protobuf-событием ядра для UI-слоя.
+class CoreEventEnvelope {
   final CoreEventType type;
-  final Uint8List rawPayload;
-  final Map<String, dynamic> parsedData;
+  final CoreEvent event;
 
-  CoreEvent({
-    required this.eventId,
-    required this.timestampMs,
-    required this.type,
-    required this.rawPayload,
-    required this.parsedData,
-  });
+  const CoreEventEnvelope(this.type, this.event);
+
+  NetworkStatusEvent? get networkStatus =>
+      event.whichEvent() == CoreEvent_Event.networkStatus ? event.networkStatus : null;
+
+  IncomingMessageEvent? get incomingMessage =>
+      event.whichEvent() == CoreEvent_Event.incomingMessage ? event.incomingMessage : null;
+
+  /// Судьба исходящего сообщения: «пакет ушёл в оверлей» и «получатель
+  /// расшифровал» — разные этапы, UI показывает их раздельно.
+  MessageStatusEvent? get messageStatus =>
+      event.whichEvent() == CoreEvent_Event.messageStatus ? event.messageStatus : null;
+
+  /// Итог fetch-контакта: бандл дошёл и карта заводятся, либо ответ не сошёлся.
+  /// Ждать его внутри команды нельзя, поэтому приходит он событием.
+  ContactResolvedEvent? get contactResolved =>
+      event.whichEvent() == CoreEvent_Event.contactUpdated ? event.contactUpdated : null;
+
+  /// Вершина оверлея: ядро объявляет её само, когда список пиров меняется по
+  /// составу (линок появился, упал, пропал), поэтому UI не обязан опрашивать
+  /// GetPeers, чтобы увидеть «пиров: 0» после обрыва.
+  PeerListUpdatedEvent? get peersUpdated =>
+      event.whichEvent() == CoreEvent_Event.peersUpdated ? event.peersUpdated : null;
+
+  /// Снимок исходящих ссылок: ядро объявляет его по изменению вершины линков,
+  /// как и peers_updated. Опросить его командой нельзя — в контракте нет
+  /// GetAntiDpiStatus, — поэтому «объявления ещё не было» означает только то,
+  /// что оно ещё не пришло, а не «ссылок нет».
+  AntiDpiStatusEvent? get antiDpi =>
+      event.whichEvent() == CoreEvent_Event.antiDpiStatus ? event.antiDpiStatus : null;
 
   @override
-  String toString() =>
-      'CoreEvent(id: $eventId, type: $type, time: $timestampMs, data: $parsedData)';
+  String toString() => 'CoreEventEnvelope(${event.whichEvent()}, id=${event.eventId})';
 }
 
-/// Singleton Bridge interface that connects Flutter Dart to Go C-Shared libygggram
+/// Ошибка со стороны Go-ядра: неверный код возврата C-ABI или success=false.
+class YggCoreException implements Exception {
+  final String message;
+  const YggCoreException(this.message);
+
+  @override
+  String toString() => 'YggCoreException: $message';
+}
+
+/// Мост Dart <-> Go C-Shared libygggram.
+///
+/// Единственный формат на границе — protobuf (`CoreRequest`/`CoreResponse`),
+/// сгенерированный из `proto/ygggram.proto`. Раньше здесь парсился самодельный
+/// BigEndian-заголовок, а ядро на него отвечало заглушками.
 class YggCoreBridge {
   static final YggCoreBridge _instance = YggCoreBridge._internal();
   factory YggCoreBridge() => _instance;
@@ -76,221 +138,134 @@ class YggCoreBridge {
   late DartFreeMemory _freeMemory;
 
   NativeCallable<CNativeEventCallback>? _nativeCallable;
-  final StreamController<CoreEvent> _eventStreamController =
-      StreamController<CoreEvent>.broadcast();
+  final StreamController<CoreEventEnvelope> _events =
+      StreamController<CoreEventEnvelope>.broadcast();
 
   bool _isInitialized = false;
+  $fixnum.Int64 _requestCounter = $fixnum.Int64.ZERO;
 
-  /// Reactive Stream of all asynchronous events coming from the Yggdrasil core
-  Stream<CoreEvent> get eventStream => _eventStreamController.stream;
+  Stream<CoreEventEnvelope> get eventStream => _events.stream;
 
   bool get isInitialized => _isInitialized;
 
-  /// Loads the platform-specific dynamic library (.dll on Windows, .so on Android)
+  /// Открывает платформу-специфичную библиотеку и привязывает C-функции.
   void loadLibrary({String? customPath}) {
     if (_lib != null) return;
 
     if (customPath != null && customPath.isNotEmpty) {
       _lib = DynamicLibrary.open(customPath);
     } else if (Platform.isWindows) {
-      // Look in standard Windows application directory or current process dir
       try {
         _lib = DynamicLibrary.open('ygggram.dll');
       } catch (_) {
-        // Fallback to local executable folder
         final exeDir = File(Platform.resolvedExecutable).parent.path;
-        final candidate = '$exeDir\\ygggram.dll';
-        _lib = DynamicLibrary.open(candidate);
+        _lib = DynamicLibrary.open('$exeDir\\ygggram.dll');
       }
     } else if (Platform.isAndroid) {
-      // Android loads directly from jniLibs
       _lib = DynamicLibrary.open('libygggram.so');
     } else if (Platform.isLinux) {
       _lib = DynamicLibrary.open('libygggram.so');
     } else if (Platform.isMacOS) {
       _lib = DynamicLibrary.open('libygggram.dylib');
     } else {
-      throw UnsupportedError('Platform ${Platform.operatingSystem} is not supported by YggCoreBridge');
+      throw UnsupportedError('YggCoreBridge не поддерживает ${Platform.operatingSystem}');
     }
 
-    // Bind C functions
     _initCore = _lib!
         .lookup<NativeFunction<CInitCore>>('InitCore')
         .asFunction<DartInitCore>();
-
     _registerEventCallback = _lib!
         .lookup<NativeFunction<CRegisterEventCallback>>('RegisterEventCallback')
         .asFunction<DartRegisterEventCallback>();
-
     _invokeCommand = _lib!
         .lookup<NativeFunction<CInvokeCommand>>('InvokeCommand')
         .asFunction<DartInvokeCommand>();
-
     _freeMemory = _lib!
         .lookup<NativeFunction<CFreeMemory>>('FreeMemory')
         .asFunction<DartFreeMemory>();
 
-    _setupNativeCallback();
-  }
-
-  /// Sets up thread-safe NativeCallable.listener for asynchronous Go-to-Dart events
-  void _setupNativeCallback() {
-    // NativeCallable.listener routes C callbacks directly to Dart Isolate event loop
-    _nativeCallable = NativeCallable<CNativeEventCallback>.listener(
-      _onNativeEventReceived,
-    );
-
+    _nativeCallable = NativeCallable<CNativeEventCallback>.listener(_onNativeEvent);
     _registerEventCallback(_nativeCallable!.nativeFunction);
   }
 
-  /// Internal handler invoked when Go triggers a background event
-  void _onNativeEventReceived(Pointer<Uint8> dataPtr, int length) {
-    if (dataPtr == nullptr || length <= 0) return;
-
-    final bytes = dataPtr.asTypedList(length);
-    final copy = Uint8List.fromList(bytes);
-
-    final event = _parseEvent(copy);
-    _eventStreamController.add(event);
-  }
-
-  /// Decodes binary wire protocol event
-  CoreEvent _parseEvent(Uint8List bytes) {
-    if (bytes.length < 18) {
-      return CoreEvent(
-        eventId: 0,
-        timestampMs: DateTime.now().millisecondsSinceEpoch,
-        type: CoreEventType.unknown,
-        rawPayload: bytes,
-        parsedData: {'rawLength': bytes.length},
-      );
-    }
-
-    final byteData = ByteData.sublistView(bytes);
-    // Header magic: 'YGG\x02' = 0x59 0x47 0x47 0x02
-    final eventId = byteData.getUint64(4, Endian.big);
-    final timestamp = byteData.getUint64(12, Endian.big);
-    final eventTypeByte = bytes[20];
-
-    CoreEventType type = CoreEventType.unknown;
-    final Map<String, dynamic> data = {};
-
-    switch (eventTypeByte) {
-      case 0x01: // NetworkStatusEvent
-        type = CoreEventType.networkStatus;
-        if (bytes.length >= 41) {
-          data['online'] = bytes[21] == 0x01;
-          data['activePeers'] = byteData.getUint32(22, Endian.big);
-          data['rxBytes'] = byteData.getUint64(26, Endian.big);
-          data['txBytes'] = byteData.getUint64(34, Endian.big);
-          if (bytes.length >= 43) {
-            final ipLen = byteData.getUint16(42, Endian.big);
-            if (bytes.length >= 44 + ipLen) {
-              data['ipv6'] = String.fromCharCodes(bytes.sublist(44, 44 + ipLen));
-            }
-          }
-        }
-        break;
-      case 0x02:
-        type = CoreEventType.peersUpdated;
-        break;
-      case 0x03:
-        type = CoreEventType.antiDpiStatus;
-        break;
-      case 0x04:
-        type = CoreEventType.incomingMessage;
-        break;
-      case 0x05:
-        type = CoreEventType.backupProgress;
-        break;
-      case 0x06:
-        type = CoreEventType.incomingCall;
-        break;
-    }
-
-    return CoreEvent(
-      eventId: eventId,
-      timestampMs: timestamp,
-      type: type,
-      rawPayload: bytes,
-      parsedData: data,
-    );
-  }
-
-  /// Initializes the Yggdrasil Go Core with local path and configuration
-  Future<bool> initialize({
-    required String dataDir,
-    String? mnemonicSeed,
-    int antiDpiMode = 1,
-    String antiDpiSni = 'www.cloudflare.com',
-  }) async {
+  /// Готовит ядро: создаёт каталоги и запускает поток событий.
+  /// Идентичность при этом не создаётся — это делает [startNode].
+  void initialize({required String dataDir, required String cacheDir}) {
     loadLibrary();
+    final config = NodeConfig()
+      ..dataDir = dataDir
+      ..cacheDir = cacheDir;
 
-    // Pack basic configuration
-    final dataDirBytes = Uint8List.fromList(dataDir.codeUnits);
-    final totalLen = 2 + dataDirBytes.length;
-    final buffer = calloc<Uint8>(totalLen);
-
-    // Store length as BigEndian Uint16
-    buffer[0] = (dataDirBytes.length >> 8) & 0xFF;
-    buffer[1] = dataDirBytes.length & 0xFF;
-
-    for (int i = 0; i < dataDirBytes.length; i++) {
-      buffer[2 + i] = dataDirBytes[i];
+    final code = _callInitCore(config.writeToBuffer());
+    if (code != 0) {
+      throw YggCoreException('InitCore вернул код $code');
     }
-
-    final result = _initCore(buffer, totalLen);
-    calloc.free(buffer);
-
-    _isInitialized = (result == 0);
-    return _isInitialized;
+    _isInitialized = true;
   }
 
-  /// Sends a synchronous or RPC command into Go Core and parses the binary response
-  Uint8List invokeCommand({required int commandType, Uint8List? payload}) {
+  int _callInitCore(List<int> payload) {
+    final ptr = calloc<Uint8>(payload.length);
+    try {
+      ptr.asTypedList(payload.length).setAll(0, payload);
+      return _initCore(ptr, payload.length);
+    } finally {
+      calloc.free(ptr);
+    }
+  }
+
+  void _onNativeEvent(Pointer<Uint8> dataPtr, int length) {
+    if (dataPtr == nullptr || length <= 0) return;
+    final bytes = Uint8List.fromList(dataPtr.asTypedList(length));
+    final event = CoreEvent.fromBuffer(bytes);
+    _events.add(CoreEventEnvelope(_eventTypeOf(event), event));
+  }
+
+  static CoreEventType _eventTypeOf(CoreEvent event) {
+    switch (event.whichEvent()) {
+      case CoreEvent_Event.networkStatus:
+        return CoreEventType.networkStatus;
+      case CoreEvent_Event.peersUpdated:
+        return CoreEventType.peersUpdated;
+      case CoreEvent_Event.antiDpiStatus:
+        return CoreEventType.antiDpiStatus;
+      case CoreEvent_Event.incomingMessage:
+        return CoreEventType.incomingMessage;
+      case CoreEvent_Event.messageStatus:
+        return CoreEventType.messageStatus;
+      case CoreEvent_Event.backupProgress:
+        return CoreEventType.backupProgress;
+      case CoreEvent_Event.incomingCall:
+        return CoreEventType.incomingCall;
+      case CoreEvent_Event.contactUpdated:
+        return CoreEventType.contactUpdated;
+      case CoreEvent_Event.notSet:
+        return CoreEventType.unknown;
+    }
+  }
+
+  /// Единая точка обмена с ядром: protobuf внутри, protobuf снаружи.
+  CoreResponse request(CoreRequest request) {
     if (!_isInitialized) {
-      throw StateError('YggCoreBridge is not initialized. Call initialize() first.');
+      throw const YggCoreException('Ядро не инициализировано: сначала initialize()');
     }
-
-    final pBytes = payload ?? Uint8List(0);
-    final reqLen = 10 + pBytes.length;
-    final reqPtr = calloc<Uint8>(reqLen);
-
-    // Request ID (8 bytes) + Command Type (2 bytes)
-    final reqId = DateTime.now().microsecondsSinceEpoch;
-    final bd = ByteData(10);
-    bd.setUint64(0, reqId, Endian.big);
-    bd.setUint16(8, commandType, Endian.big);
-
-    for (int i = 0; i < 10; i++) {
-      reqPtr[i] = bd.getUint8(i);
-    }
-    for (int i = 0; i < pBytes.length; i++) {
-      reqPtr[10 + i] = pBytes[i];
-    }
-
+    final payload = request.writeToBuffer();
+    final reqPtr = calloc<Uint8>(payload.length);
     final respPtrPtr = calloc<Pointer<Uint8>>();
     final respLenPtr = calloc<Int32>();
-
     try {
-      final code = _invokeCommand(reqPtr, reqLen, respPtrPtr, respLenPtr);
+      reqPtr.asTypedList(payload.length).setAll(0, payload);
+      final code = _invokeCommand(reqPtr, payload.length, respPtrPtr, respLenPtr);
       if (code != 0) {
-        throw Exception('InvokeCommand returned error code: $code');
+        throw YggCoreException('InvokeCommand вернул код $code');
       }
-
       final outPtr = respPtrPtr.value;
       final outLen = respLenPtr.value;
-
       if (outPtr == nullptr || outLen <= 0) {
-        return Uint8List(0);
+        throw const YggCoreException('Ядро вернуло пустой ответ');
       }
-
-      final resultBytes = Uint8List.fromList(outPtr.asTypedList(outLen));
-
-      // Free C memory allocated by Go C.CBytes()
+      final response = CoreResponse.fromBuffer(outPtr.asTypedList(outLen));
       _freeMemory(outPtr);
-
-      return resultBytes;
+      return response;
     } finally {
       calloc.free(reqPtr);
       calloc.free(respPtrPtr);
@@ -298,35 +273,110 @@ class YggCoreBridge {
     }
   }
 
-  /// Convenience method: Start Yggdrasil Node
-  void startNode() {
-    invokeCommand(commandType: 1);
+  /// Исполняет запрос и бросает исключение, если ядро ответило ошибкой.
+  CoreResponse _ask(CoreRequest Function($fixnum.Int64 id) build) {
+    final response = request(build(++_requestCounter));
+    if (!response.success) {
+      throw YggCoreException(response.errorMessage.isEmpty
+          ? 'ядро отклонило запрос'
+          : response.errorMessage);
+    }
+    return response;
   }
 
-  /// Convenience method: Stop Yggdrasil Node
-  void stopNode() {
-    invokeCommand(commandType: 2);
+  /// Запускает оверлей-ноду на мнемонике. Пустая мнемоника — ошибка, а не
+  /// молчаливая генерация ключа «на лету».
+  ///
+  /// [listenAddress] обязателен по смыслу: без него ядро поднимает только
+  /// исходящие соединения, и никто не сможет придти к нам. Если порт занят,
+  /// yggdrasil пишет в лог и остаётся исходящей — это не роняет запуск.
+  NodeStatusResp startNode({
+    required String mnemonicSeed,
+    required String dataDir,
+    required String cacheDir,
+    String listenAddress = '0.0.0.0',
+    int listenPort = 54321,
+    List<String> bootstrapPeers = const [],
+    bool enableLanMulticast = true,
+    AntiDpiMode antiDpiMode = AntiDpiMode.ANTI_DPI_UTLS_CHROME,
+  }) {
+    final config = NodeConfig()
+      ..dataDir = dataDir
+      ..cacheDir = cacheDir
+      ..mnemonicSeed = mnemonicSeed
+      ..antiDpiMode = antiDpiMode
+      ..listenAddress = listenAddress
+      ..listenPort = listenPort
+      ..enableLanMulticast = enableLanMulticast
+      ..bootstrapPeers.addAll(bootstrapPeers);
+    final response = _ask((id) => CoreRequest(
+        requestId: id, startNode: StartNodeReq(config: config)));
+    return response.nodeStatus;
   }
 
-  /// Convenience method: Query Node Status
-  Uint8List getNodeStatus() {
-    return invokeCommand(commandType: 3);
-  }
+  void stopNode() => _ask((id) => CoreRequest(requestId: id, stopNode: StopNodeReq()));
 
-  /// Convenience method: Query Connected Peers
-  Uint8List getPeers() {
-    return invokeCommand(commandType: 4);
-  }
+  NodeStatusResp nodeStatus() =>
+      _ask((id) => CoreRequest(requestId: id, getNodeStatus: GetNodeStatusReq())).nodeStatus;
 
-  /// Convenience method: Send Message
-  void sendMessage(Uint8List messagePayload) {
-    invokeCommand(commandType: 5, payload: messagePayload);
-  }
+  List<PeerInfo> peers() =>
+      _ask((id) => CoreRequest(requestId: id, getPeers: GetPeersReq())).peerList.peers;
 
-  /// Clean disposal of native listener callbacks and stream controllers
+  List<PeerInfo> connectPeer(String uri) => _ask((id) => CoreRequest(
+        requestId: id,
+        connectPeer: ConnectPeerReq(peerUri: uri),
+      )).peerList.peers;
+
+  PreKeyBundle preKeyBundle() =>
+      _ask((id) => CoreRequest(requestId: id, getPrekeyBundle: GetPreKeyBundleReq()))
+          .prekeyBundle;
+
+  void addContact(ContactCard card) =>
+      _ask((id) => CoreRequest(requestId: id, addContact: AddContactReq(contact: card)));
+
+  /// Завести контакт по одному лишь ed25519-ключу узла (32 байта): ядро шлёт
+  /// bundle_req и отвечает событием contact_updated, поэтому здесь возвращается
+  /// только факт отправки запроса.
+  FetchContactResp fetchContact(List<int> nodeEd25519Pubkey, {String nickname = ''}) => _ask(
+          (id) => CoreRequest(
+              requestId: id,
+              fetchContact: FetchContactReq(
+                  nodeEd25519Pubkey: nodeEd25519Pubkey, nickname: nickname)))
+      .fetchContact;
+
+  SendMessageResp sendMessage(SendMessageReq message) =>
+      _ask((id) => CoreRequest(requestId: id, sendMessage: message)).sendMessage;
+
+  /// Новая 12-словная фраза от ядра: entropy и словарь живут на стороне ядра.
+  String generateIdentity() =>
+      _ask((id) => CoreRequest(requestId: id, generateIdentity: GenerateIdentityReq()))
+          .identity
+          .mnemonic;
+
+  List<ConversationInfo> conversations({int limit = 0}) => _ask(
+          (id) => CoreRequest(
+              requestId: id,
+              listConversations: ListConversationsReq(limit: limit)))
+      .conversations
+      .conversations;
+
+  List<ChatMessage> messages(String conversationId, {int limit = 50}) => _ask(
+          (id) => CoreRequest(
+              requestId: id,
+              getMessages: GetMessagesReq(
+                  conversationId: conversationId, limit: limit)))
+      .messages
+      .messages;
+
+  List<ContactCard> contacts() =>
+      _ask((id) => CoreRequest(requestId: id, listContacts: ListContactsReq()))
+          .contacts
+          .contacts;
+
   void dispose() {
     _nativeCallable?.close();
     _nativeCallable = null;
-    _eventStreamController.close();
+    _events.close();
+    _isInitialized = false;
   }
 }
