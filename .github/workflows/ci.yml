@@ -83,10 +83,10 @@ jobs:
           export PATH="$PATH:$(go env GOPATH)/bin:$HOME/.pub-cache/bin"
           buf generate
           if ! git diff --exit-code core/proto/ app/lib/gen/; then
-            echo "::error proto/ygggram.proto расходится со сгенерированным кодом. Запустите: make proto"
+            echo "::error ::proto/ygggram.proto расходится со сгенерированным кодом. Запустите: make proto"
             git diff --stat core/proto/ app/lib/gen/
             exit 1
-          }
+          fi
 
   flutter-app:
     name: Flutter App
